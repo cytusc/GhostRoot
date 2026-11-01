@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="com.hoyo.ghostroot.permission.START_SERVICE" />
+
+    <!-- v32: signature 级权限——只有同签名（本 App）可持有，第三方应用
+         无法启动 GhostRootService（审查 P0：exported=true 原先无保护）。 -->
+    <permission
+        android:name="com.hoyo.ghostroot.permission.START_SERVICE"
+        android:protectionLevel="signature" />
+
+    <application
+        android:allowBackup="false"
+        android:label="GhostRoot"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="GhostRoot">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- v22: exported so the phone babysitter (adb/PC) can burn the fuse
+         * with `am start-foreground-service -a RUN`. The service itself still
+         * refuses to act unless Shizuku is alive.
+         * v32: 加 signature 权限门——第三方应用拿不到该权限无法启动本服务，
+         * 意外触发/重启风险消除。副作用：PC 端 `am` 遥控点火同样失效
+         * （shell uid 不持本签名权限）；App 内按钮与通知按钮（本 App 自己
+         * 创建的 PendingIntent）不受影响。 -->
+        <service
+            android:name=".GhostRootService"
+            android:exported="true"
+            android:permission="com.hoyo.ghostroot.permission.START_SERVICE"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="root-automation-watcher" />
+        </service>
+
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+    </application>
+</manifest>

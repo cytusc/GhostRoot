@@ -1,0 +1,13 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# IDE / 本机
+local.properties
+.idea/
+*.iml
+.DS_Store
+
+# 构建产物（可由源码复现）
+*.apk
