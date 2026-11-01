@@ -10,8 +10,8 @@ android {
         applicationId = "com.hoyo.ghostroot"
         minSdk = 26
         targetSdk = 34
-        versionCode = 35
-        versionName = "2.19"
+        versionCode = 36
+        versionName = "2.20"
     }
 
     buildTypes {
