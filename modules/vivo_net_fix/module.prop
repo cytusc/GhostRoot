@@ -1,0 +1,6 @@
+id=vivo_net_fix
+name=Vivo AntiRoot NetFix
+version=1.6
+versionCode=6
+author=GhostRoot project
+description=解封 vivo 反root LSM 对应用/shell 域的网络拦截：189 条域级 permissive + kernel 域；exploit 后保持全局 Permissive 为预期稳定态（2026-11-01 实测 enforcing 下 kernel/unlabeled 数据面被拦，域级放行无法覆盖）；service.sh 落盘审计
