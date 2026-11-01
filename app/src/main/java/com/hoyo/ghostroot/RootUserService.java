@@ -317,11 +317,10 @@ public class RootUserService extends IRootRunner.Stub {
 
             dumpDiagnostics(workDir);
 
-            /* v36 (borrowed from DirtyFrag-vr kmsglog): /dev/kmsg 逐行 fsync 跟随器。
-             * wedge/watchdog 复位会吃掉页缓存（pstore 也经常缺失），但 /dev/kmsg
-             * 是阻塞读 + 每行直接落盘 + FileDescriptor.sync()，复位前的内核输出
-             * 能留存到 /data/local/tmp/ghostroot-kmsg.log —— 这是我们第一次能
-             * 在 wedge 后看到内核侧死因（EDEADLK 卡死时 route 阶段在内核里做了什么）。 */
+            /* v37 (borrowed from DirtyFrag-vr kmsglog): 内核日志逐行 fsync 跟随器，
+             * 走 logcat -b kernel 通路（v36 的 /dev/kmsg 直读被 SELinux 拒）。
+             * wedge/watchdog 复位会吃掉页缓存（pstore 也经常缺失），逐行 sync 落盘
+             * 让复位前的内核输出留存到 /data/local/tmp/ghostroot-kmsg.log。 */
             startKmsgFollower(callback);
 
             /* ===== up to MAX_ROUNDS full attacks this boot (PC autoroot flow) =====
@@ -626,35 +625,27 @@ public class RootUserService extends IRootRunner.Stub {
         return rootShell("id", 30).out.trim();
     }
 
-    /** v36: /dev/kmsg 逐行 fsync 跟随器（borrowed from DirtyFrag-vr kmsglog）。
-     * read() 在 /dev/kmsg 上天然阻塞跟随新消息；每行落盘后 FileDescriptor.sync()
-     * 强推磁盘 —— watchdog 复位不经过正常关机也留得住复位前的内核日志。
-     * 上限 16MB 防无限增长； UserService 进程死亡时线程随进程消亡。 */
+    /** v37: 内核日志逐行 fsync 跟随器（borrowed from DirtyFrag-vr kmsglog）。
+     * v36 的 /dev/kmsg 直读在 enforcing 下被 SELinux 拒（shell 域 kmsg_device read
+     * 不放行，实测 Permission denied）→ 改走 logd 代理：`logcat -b kernel -v raw`
+     * 持续流式读取（logd 以特权身份读 kmsg，shell→logd socket 放行）。
+     * 每行落盘后 FileDescriptor.sync() 强推 —— watchdog 复位不经过正常关机也
+     * 留得住复位前的内核日志。上限 16MB 防无限增长；UserService 进程死亡时线程随进程消亡。 */
     private void startKmsgFollower(ILogCallback callback) {
         final String KMSG_LOG = "/data/local/tmp/ghostroot-kmsg.log";
         final long MAX_BYTES = 16L * 1024 * 1024;
         Thread t = new Thread(() -> {
-            try (java.io.FileInputStream in = new java.io.FileInputStream("/dev/kmsg");
+            try (java.io.BufferedReader in = new java.io.BufferedReader(
+                    new InputStreamReader(new java.lang.ProcessBuilder(
+                            "logcat", "-b", "kernel", "-v", "raw").start().getInputStream()));
                  java.io.FileOutputStream out = new java.io.FileOutputStream(KMSG_LOG, true)) {
                 out.write(("=== kmsg follower start ts=" + System.currentTimeMillis() / 1000
                         + " uptime=" + readUptime() + "s ===\n").getBytes());
                 out.getFD().sync();
-                java.io.ByteArrayOutputStream line = new java.io.ByteArrayOutputStream();
-                byte[] buf = new byte[4096];
-                while (out.getChannel().size() < MAX_BYTES) {
-                    int n = in.read(buf);
-                    if (n < 0) break;
-                    for (int i = 0; i < n; i++) {
-                        byte b = buf[i];
-                        if (b == '\n') {
-                            out.write(line.toByteArray());
-                            out.write('\n');
-                            out.getFD().sync();   // per-line fsync — the whole point
-                            line.reset();
-                        } else {
-                            line.write(b);
-                        }
-                    }
+                String ln;
+                while (out.getChannel().size() < MAX_BYTES && (ln = in.readLine()) != null) {
+                    out.write((ln + "\n").getBytes());
+                    out.getFD().sync();   // per-line fsync — the whole point
                 }
             } catch (Throwable e) {
                 try {
@@ -665,7 +656,7 @@ public class RootUserService extends IRootRunner.Stub {
         }, "kmsg-follower");
         t.setDaemon(true);
         t.start();
-        log(callback, "kmsg follower started -> " + KMSG_LOG + " (per-line fsync, cap 16MB)");
+        log(callback, "kmsg follower started (logcat -b kernel) -> " + KMSG_LOG);
     }
 
     /** v35: DirtyFrag-vr W1c 摘除去证 —— root 活着时读 dmesg 找
