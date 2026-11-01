@@ -1,6 +1,6 @@
 id=ghost_hide
 name=Ghost Hide (Root 兜底屏蔽)
-version=0.3
-versionCode=3
+version=0.4
+versionCode=4
 author=GhostRoot project
-description=系统级 root 兜底屏蔽（零守护进程）：非 KSU 的 su 残留一律 chmod 000、/proc/modules 440、root 授权审计（系统级/vivo 探针包持 root 即告警）、反干扰守卫。细粒度按应用屏蔽由 Hide-My-Applist (LSPosed) 负责，本模块是全局底线
+description=系统级 root 兜底屏蔽（零守护进程）：非 KSU 的 su 残留一律 chmod 000、/proc/modules 440、root 授权审计（系统级/vivo 探针包/敏感包持 root 即告警）、反干扰守卫、敏感 App（银行/支付/购物/社交支付）定向加固审计、自同步通道（/data/local/tmp/ghost-module-sync 开机落地绕开 LSM 封锁）。细粒度按应用屏蔽由 HMA + ZygiskNext denylist 负责，环境伪装由 bszip 悲伤一键负责，本模块是全局底线且绝不触碰网络

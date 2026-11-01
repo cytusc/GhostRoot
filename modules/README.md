@@ -4,7 +4,7 @@
 KernelSU 管理器安装，或在 exploit 开火后的解锁窗口直接铺到
 `/data/adb/modules/`。
 
-## ghost_hide — 系统级 root 兜底屏蔽（v0.3 / vc3）
+## ghost_hide — 系统级 root 兜底屏蔽（v0.4 / vc4，v0.4 新增：敏感 App 定向加固 + 自同步通道）
 
 - 非 KSU 的 su 残留（xbin/su、sbin/su、su/bin、vendor/bin/su、Superuser.apk）chmod 000
 - `/proc/modules` chmod 440（普通应用读不到内核模块列表）
@@ -14,7 +14,7 @@ KernelSU 管理器安装，或在 exploit 开火后的解锁窗口直接铺到
 - 反干扰守卫（清 netfix disable）、基线快照
 - 日志：`/data/adb/ghost_hide/log.txt`
 
-## vivo_net_fix — vivo 反 root 网络解封（v1.6 / vc6）
+## vivo_net_fix — vivo 反 root 网络解封（v1.7 / vc7，v1.7 新增：网络金丝雀自检）
 
 - 主体：`sepolicy.rule` 190 条域级 permissive（189 条应用/网络域 + kernel 域）
 - **v1.6 红线变更（2026-11-01 enforcing 实验结论）**：全局 Enforcing 下

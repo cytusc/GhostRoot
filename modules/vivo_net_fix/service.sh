@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # Vivo NetFix v1.6 — 开机审计（v1.5→v1.6 红线变更）
 #
-# v1.6 变更（2026-11-01 实测结论）：
+# v1.6→v1.7 变更（2026-11-01 实测结论）：
 #   enforcing 实验证明：全局 Enforcing 下 WiFi 数据面（dp_rx_thread，kernel 域
 #   scontext + unlabeled 包类型）被 LSM 拦截，unlabeled 是类型不是域、无法用
 #   permissive 放行 → 189 条域级规则覆盖不到数据面，网络必断。
@@ -18,7 +18,7 @@ LOG=/data/adb/vivo_net_fix/log.txt
 mkdir -p /data/adb/vivo_net_fix
 
 {
-echo "=== vivo_net_fix v1.6 $(date) ==="
+echo "=== vivo_net_fix v1.7 $(date) ==="
 
 ENFORCE=$(cat /sys/fs/selinux/enforce 2>/dev/null)
 if [ "$ENFORCE" = "1" ]; then
@@ -39,6 +39,19 @@ done
 # 若存在 ksud-gk 且需要 enforcing 实战，可手动：
 #   /data/local/tmp/ksud-gk sepolicy apply /data/adb/modules/vivo_net_fix/sepolicy.rule
 # 但注意：apply 只解决域级放行，kernel/unlabeled 数据面仍需 allow 规则，enforcing 依旧不可用。
+
+# ---- 网络金丝雀（v1.7）：网络是否恢复的唯一客观判据 ----
+# 这是「悲伤一键隐藏环境启用前」的门禁：ghost_hide 先完成系统级隐藏，
+# 本模块恢复网络，金丝雀确认 [ok] 之后，bszip 环境伪装层才允许启用。
+CANARY_IP=$(ping -c 1 -W 3 223.5.5.5 2>/dev/null | grep -c '1 received')
+CANARY_DNS=$(ping -c 1 -W 3 www.baidu.com 2>/dev/null | grep -c '1 received')
+if [ "$CANARY_IP" = "1" ] && [ "$CANARY_DNS" = "1" ]; then
+  echo "[ok] net-canary: IP + DNS both PASS —— 网络已恢复，隐藏环境层可启用"
+elif [ "$CANARY_IP" = "1" ]; then
+  echo "[FAIL] net-canary: IP 通但 DNS 断 —— 域级规则未覆盖 DNS 链路，检查 dnsmasq/clatd"
+else
+  echo "[FAIL] net-canary: IP 不通 —— 数据面被拦或飞行模式，ghost_hide/网络层需排查"
+fi
 
 echo "=== done ==="
 } >> $LOG 2>&1
