@@ -173,7 +173,7 @@ public class GhostRootService extends Service {
                 .daemon(false)
                 .processNameSuffix("root")
                 .debuggable(false)
-                .version(30);
+                .version(31);
     }
 
     @Override
@@ -326,6 +326,9 @@ public class GhostRootService extends Service {
                     + (pv.env == null || pv.env.isEmpty() ? "" : " env=" + pv.env)
                     + (pv.uapi == null || pv.uapi.isEmpty() ? "" : " uapi=" + pv.uapi)
                     + (pv.zn == null || pv.zn.isEmpty() ? "" : " zygisk=" + pv.zn)
+                    /* v42: fire 链收尾状态随行 —— still-running 时界面必须
+                     * 提示"暂勿打开管理器"，与 RootUserService 门禁一致。 */
+                    + (pv.firek == null || pv.firek.isEmpty() ? "" : " fire=" + pv.firek)
                     + " reason=" + pv.reason;
         } else if (code == -3) {
             verdict = 1;
@@ -397,6 +400,7 @@ public class GhostRootService extends Service {
         String env;
         String uapi;
         String zn;
+        String firek;
         String reason;
         String session;
     }
@@ -427,6 +431,7 @@ public class GhostRootService extends Service {
                     case "env": pv.env = v; break;
                     case "uapi": pv.uapi = v; break;
                     case "zn": pv.zn = v; break;
+                    case "firek": pv.firek = v; break;
                     case "session": pv.session = v; break;
                     case "reason": pv.reason = v; break;
                     default: break;

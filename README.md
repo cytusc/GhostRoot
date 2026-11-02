@@ -6,10 +6,21 @@
 ## 版本
 
 ```
-versionCode  17
-versionName  2.6
-UserService  8        ← 改 RootUserService 逻辑必须同步 +1
+versionCode  42
+versionName  2.26
+UserService  31       ← 改 RootUserService 逻辑必须同步 +1
 ```
+
+### v42（2026-11-02，13:2x 连续复位事故修复）
+
+| 修复项 | 位置 |
+|---|---|
+| fire.sh v6：b0 加 10s 硬超时，chain_fired/exploit_killed 必然执行 | `scripts/device-artifacts/fire.sh`（已推设备） |
+| fire.sh v6：`.fire.pid` 记 "pid boot_id"，跨 boot PID 复用 + 同秒双实例竞态修复 | 同上 |
+| one.sh v6：W1c 失败诊断（dfroot_vr.ko size/md5/uname） | `scripts/device-artifacts/one.sh`（已推设备） |
+| armFireWatcher：boot_id + /proc cmdline 存活校验 | `RootUserService` |
+| 管理器门禁：magica 通过 且 exploit 已终止才提示可开管理器；firek 字段进 verdict/UI | `RootUserService` + `GhostRootService` |
+| 落地后归档 /data/tombstones → /data/local/tmp/gr-tomb-\<ts\>/ | `RootUserService.archiveTombstones` |
 
 ## 已构建产物
 

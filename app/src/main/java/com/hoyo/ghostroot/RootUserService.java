@@ -137,6 +137,9 @@ public class RootUserService extends IRootRunner.Stub {
     /** v41: ZygiskNext 激活结果 —— zn-ok-zygoteN / zn-softreboot-scheduled /
      * zn-zygote0-softreboot-cooldown(Nm) / zn-absent / zn-error:*。 */
     private String lastZn = "not-run";
+    /** v42 (13:2x 复位事故修复): fire 链收尾状态 —— killed=exploit 进程已不在
+     * / still-running=落地后 ghostlock 还在跑（管理器门禁据此拒绝放行）。 */
+    private String lastFirek = "not-run";
     /** v27: this session's own log file (never overwritten by the next run). */
     private String currentSessionFile;
     /** v33: 当前会话 ID（服务端下发）。verdict 文件会带上 session= 字段，
@@ -319,13 +322,21 @@ public class RootUserService extends IRootRunner.Stub {
                      * 不能在检查前就说"直接打开管理器"。 */
                     boolean mgrOk = "manager-patched".equals(lastMagica)
                             || "already-patched".equals(lastMagica);
-                    log(callback, "已在本 boot 拿到 root（无需再打）；管理器补丁状态="
-                            + lastMagica + (mgrOk
+                    /* v42: 管理器门禁（already-rooted 路径）—— 本 boot 未跑
+                     * exploit，仍防同 boot 前序会话残留的 ghostlock 进程。 */
+                    lastFirek = exploitRunning() ? "still-running" : "killed";
+                    log(callback, "已在本 boot 拿到 root（无需再打）；管理器门禁="
+                            + "magica:" + lastMagica + "/exploit:" + lastFirek
+                            + (mgrOk && "killed".equals(lastFirek)
                             ? " → 可直接打开 KernelSU 管理器"
-                            : " → 打开管理器前先跑 PC fix.sh"));
+                            : " → 暂勿打开管理器（"
+                            + (!mgrOk ? "补丁未通过，先跑 PC fix.sh"
+                            : "存在残留 ghostlock 进程，先 pkill -9 -x ghostlock") + "）"));
                     /* v30/v31: 采样入口覆盖 already-rooted 路径 —— root 活着
                      * 但不攻击的会话同样要抓 pstore/取证快照 */
                     attemptPstoreSample(callback, true);
+                    /* v42: tombstone 归档（root 通道活着时做） */
+                    archiveTombstones(callback);
                     /* v35: W1c 摘除去证 —— already-rooted 路径同样验证 */
                     lastVrDisarmed = vrDisarmProbe();
                     log(callback, "vr_disarmed=" + lastVrDisarmed + " (W1c dmesg evidence)");
@@ -510,6 +521,8 @@ public class RootUserService extends IRootRunner.Stub {
         sb.append("uapi=").append(lastUapi).append('\n');
         /* v41: ZygiskNext 激活结果（zn-ok-zygoteN / zn-softreboot-scheduled / ...） */
         sb.append("zn=").append(lastZn).append('\n');
+        /* v42: fire 链收尾状态 —— killed / still-running（管理器门禁依据） */
+        sb.append("firek=").append(lastFirek).append('\n');
         sb.append("reason=").append(lastReason).append('\n');
         writeLine(VERDICT_FILE, sb.toString(), false);
     }
@@ -557,6 +570,29 @@ public class RootUserService extends IRootRunner.Stub {
              * 万一触发软重启也不影响前面的取证与守卫步骤 */
             lastZn = zygiskAutoActivate(callback);
             log(callback, "zygisk=" + lastZn);
+            /* v42 (13:2x 复位事故修复): 管理器门禁 —— magica 补丁通过 且
+             * exploit 已被 fire 链终止，两个条件齐备才放行。事故现场：fire 链
+             * 卡死在 b0、exploit_killed 从未执行，ghostlock 的 W2/W3 继续
+             * 写已落地的内核；此时打开管理器（ksud 内核侧活动）叠加即
+             * 触发 init abort → 重启。 */
+            boolean mgrOk = "manager-patched".equals(magica)
+                    || "already-patched".equals(magica);
+            /* fire.sh v6 在 KSU 出现后 0-20s 内杀 ghostlock；给一个有界等待再判定 */
+            boolean exploitGone = !exploitRunning();
+            for (int w = 0; !exploitGone && w < 25; w++) {
+                Thread.sleep(1000);
+                exploitGone = !exploitRunning();
+            }
+            lastFirek = exploitGone ? "killed" : "still-running";
+            log(callback, "管理器门禁: magica=" + magica + " exploit=" + lastFirek
+                    + (mgrOk && "killed".equals(lastFirek)
+                    ? " → 可打开 KernelSU 管理器"
+                    : " → 暂勿打开管理器（" + (!mgrOk
+                    ? "补丁未通过，先跑 fix.sh"
+                    : "exploit 仍在跑：等 .fire.log 出现 exploit_killed，或手动 pkill -9 -x ghostlock")
+                    + "）"));
+            /* v42: 趁 root 通道活着归档 tombstone（dropbox 回收不可靠） */
+            archiveTombstones(callback);
             log(callback, "SUCCESS (root verified) in round " + round
                     + ": enforce=" + enforce + " ksu=" + ksu);
         } else {
@@ -1326,18 +1362,16 @@ public class RootUserService extends IRootRunner.Stub {
                 log(callback, "fire.sh missing; skipping watcher");
                 return;
             }
-            /* one watcher only: PC-side uses .fire.pid to dedupe */
+            /* v42: one watcher only —— 旧判定只 kill -0 pidfile 里的 pid，两个缺陷：
+             * 1) 跨 boot 残留 pid 可被 PID 复用误判存活；2) pre-loop 与每轮各
+             * arm 一次，同秒内两次调用都读不到对方刚要写的 pid → 双实例
+             * （13:23:25 实测 pid=16828/16840 两条 LANDED、one.sh 双跑）。
+             * v6 起 fire.sh 把 "pid boot_id" 写进 pidfile 并自检，这里同步校验。 */
             File pidFile = new File("/data/local/tmp/.fire.pid");
-            String pid = readText(pidFile.getAbsolutePath()).trim();
-            if (!pid.isEmpty()) {
-                try {
-                    String alive = execOut("kill", "-0", pid);
-                    if (!alive.isEmpty()) {
-                        log(callback, "fire watcher alive pid=" + pid);
-                        return;
-                    }
-                } catch (Exception ignored) {
-                }
+            String pidLine = readText(pidFile.getAbsolutePath()).trim();
+            if (fireWatcherAlive(pidLine)) {
+                log(callback, "fire watcher alive pid=" + pidLine.split("\\s+")[0]);
+                return;
             }
             /* detached fire watcher: survives UserService teardown, same as
              * PC ensure_fire (nohup-style, deduped via .fire.pid) */
@@ -1350,6 +1384,69 @@ public class RootUserService extends IRootRunner.Stub {
             log(callback, "fire watcher armed (detached)");
         } catch (Exception e) {
             log(callback, "fire arm error: " + e);
+        }
+    }
+
+    /** v42: fire watcher 存活判定 —— pidfile 格式 "pid boot_id"（fire.sh v6 写入）。
+     * 同 boot_id 且 /proc/<pid>/cmdline 含 fire.sh 才算存活；旧 v5 单 token 格式
+     * 无法排除 PID 复用，一律视为失效（重新 arm 由 fire.sh 自身去重兜底）。 */
+    private boolean fireWatcherAlive(String pidLine) {
+        if (pidLine == null || pidLine.isEmpty()) {
+            return false;
+        }
+        String[] parts = pidLine.split("\\s+");
+        if (parts.length < 2) {
+            return false;
+        }
+        String bootId = readText("/proc/sys/kernel/random/boot_id");
+        if (bootId == null || !bootId.trim().equals(parts[1])) {
+            return false;
+        }
+        String cmdline = readText("/proc/" + parts[0] + "/cmdline");
+        return cmdline != null && cmdline.contains("fire.sh");
+    }
+
+    /** v42: ghostlock exploit 进程是否仍在运行 —— /proc 扫描（不用 pgrep -f，
+     * 它会自匹配，见 fire.sh 注释）。落地后 exploit 未被 fire 链杀掉是 13:23
+     * 事故的直接放大器（W2/W3 修复段继续写已落地的内核）。 */
+    private boolean exploitRunning() {
+        File[] procs = new File("/proc").listFiles(
+                (d, n) -> n.matches("\\d+"));
+        if (procs == null) {
+            return false;
+        }
+        for (File p : procs) {
+            String c = readText(new File(p, "cmdline").getAbsolutePath());
+            if (c != null && c.contains("ghostlock")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** v42: /data/tombstones 归档 —— dropbox 对 isPrevious 条目的回收不可靠
+     * （2026-11-02 实测：09:58:50 的 init abort tombstone 拖了 3 个 boot 才进
+     * dropbox；中途复位还会让崩溃现场整批丢失）。root 落地后趁通道活着把整
+     * 目录拷到 /data/local/tmp/gr-tomb-<ts>/。仅 root 验证通过后调用。 */
+    private void archiveTombstones(ILogCallback callback) {
+        try {
+            ShellResult ls = rootShell("ls -A /data/tombstones 2>/dev/null | head -3", 20);
+            if (ls.timedOut || !ls.ok() || ls.out.trim().isEmpty()) {
+                log(callback, "[TOMB] /data/tombstones unreadable or empty"
+                        + " (exit=" + ls.exit + (ls.timedOut ? " TIMEDOUT" : "") + ") — skip");
+                return;
+            }
+            String dir = TMP + "/gr-tomb-" + System.currentTimeMillis() / 1000;
+            ShellResult cp = rootShell("mkdir -p " + dir
+                    + " && cp -a /data/tombstones/. " + dir + "/ && ls " + dir + " | wc -l", 60);
+            if (cp.ok()) {
+                log(callback, "[TOMB] archived " + cp.out.trim() + " files -> " + dir);
+            } else {
+                log(callback, "[TOMB] archive FAILED (exit=" + cp.exit
+                        + (cp.timedOut ? " TIMEDOUT" : "") + "): " + cp.out.trim());
+            }
+        } catch (Exception e) {
+            log(callback, "[TOMB] archive error: " + e);
         }
     }
 
