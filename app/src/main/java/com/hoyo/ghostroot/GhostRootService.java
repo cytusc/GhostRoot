@@ -173,7 +173,7 @@ public class GhostRootService extends Service {
                 .daemon(false)
                 .processNameSuffix("root")
                 .debuggable(false)
-                .version(26);
+                .version(27);
     }
 
     @Override
@@ -301,6 +301,9 @@ public class GhostRootService extends Service {
                     + (pv.su == null || pv.su.isEmpty() ? "" : " su=" + pv.su)
                     + (pv.magica == null || pv.magica.isEmpty() ? "" : " magica=" + pv.magica)
                     + (pv.vrDisarmed == null || pv.vrDisarmed.isEmpty() ? "" : " vr_disarmed=" + pv.vrDisarmed)
+                    + (pv.krn == null || pv.krn.isEmpty() ? "" : " krn=" + pv.krn)
+                    + (pv.env == null || pv.env.isEmpty() ? "" : " env=" + pv.env)
+                    + (pv.uapi == null || pv.uapi.isEmpty() ? "" : " uapi=" + pv.uapi)
                     + " reason=" + pv.reason;
         } else if (code == -3) {
             verdict = 1;
@@ -368,6 +371,9 @@ public class GhostRootService extends Service {
         int round = -1;
         String magica;
         String vrDisarmed;
+        String krn;
+        String env;
+        String uapi;
         String reason;
         String session;
     }
@@ -394,6 +400,9 @@ public class GhostRootService extends Service {
                     case "round": pv.round = Integer.parseInt(v); break;
                     case "magica": pv.magica = v; break;
                     case "vr_disarmed": pv.vrDisarmed = v; break;
+                    case "krn": pv.krn = v; break;
+                    case "env": pv.env = v; break;
+                    case "uapi": pv.uapi = v; break;
                     case "session": pv.session = v; break;
                     case "reason": pv.reason = v; break;
                     default: break;

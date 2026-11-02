@@ -73,6 +73,11 @@ public class RootUserService extends IRootRunner.Stub {
      * /data/local/tmp/libksud.so (2c84145e...). After root lands the service
      * runs fix.sh via su so the manager is safe to open on THIS boot. */
     private static final String TMP = "/data/local/tmp";
+
+    /** v38 (RootFamiliar checkKernel 借鉴): profile.bin 符号地址唯一对应的内核。 */
+    private static final String EXPECTED_KERNEL_RELEASE = "5.15.197-g346b1c36bd5c-dirty";
+    /** v38: 本机内核的 ksud uapi（2026-11-01 ksud-gk 配平实测）。 */
+    private static final int EXPECTED_KSUD_UAPI = 5;
     private static final String ASSET_LIB = "libksud-fixed.so";
     private static final String ASSET_FIX = "fix.sh";
     private static final String FIXED_LIB_MD5 = "2c84145e3efb6f7f045fef3ed1eea4c6";
@@ -105,6 +110,14 @@ public class RootUserService extends IRootRunner.Stub {
     /** v35: DirtyFrag-vr W1c 取证 —— 1=dmesg 有摘除行 / 0=dmesg 可读但无此行
      * / unknown=dmesg 不可读（shell 域受限），取证只在 root 活着时做。 */
     private String lastVrDisarmed = "unknown";
+    /** v38 (RootFamiliar checkKernel 借鉴): uname -r（/proc/sys/kernel/osrelease）。
+     * 与 profile 期望内核不符时 fail-fast，绝不在 OTA 后的陌生内核上开火。 */
+    private String lastKernelRelease = "unknown";
+    /** v38 (RootFamiliar EnvProbe 借鉴): 工作区可用性摘要 tmp:wx adb:r kallsyms:full。 */
+    private String lastEnv = "unknown";
+    /** v38 (RootFamiliar ManagerProbe.uapi 借鉴): /data/adb/ksud 的 (uapi: N)
+     * 与内核 uapi 不匹配时自动换装 /data/local/tmp/ksud-gk（含 b0 通道兜底）。 */
+    private String lastUapi = "not-checked";
     /** v27: this session's own log file (never overwritten by the next run). */
     private String currentSessionFile;
     /** v33: 当前会话 ID（服务端下发）。verdict 文件会带上 session= 字段，
@@ -171,6 +184,9 @@ public class RootUserService extends IRootRunner.Stub {
         lastRound = -1;
         lastMagica = "not-run";
         lastVrDisarmed = "unknown";
+        lastKernelRelease = "unknown";
+        lastEnv = "unknown";
+        lastUapi = "not-checked";
         try {
             /* v19: from now on every narrative line lands on disk too, so a
              * natural reset can no longer erase the session's story. */
@@ -238,6 +254,26 @@ public class RootUserService extends IRootRunner.Stub {
             }
             log(callback, "preflight ok: ghostlock + profile(md5) + fire.sh + one.sh + b0");
 
+            /* v38 (RootFamiliar checkKernel 借鉴): 先确认内核再开火。
+             * profile.bin 的符号地址只对这一个内核有效 —— OTA/换内核后
+             * 乱开火就是给 vr.ko 送采样。 */
+            lastKernelRelease = readText("/proc/sys/kernel/osrelease").trim();
+            if (!EXPECTED_KERNEL_RELEASE.equals(lastKernelRelease)) {
+                log(callback, "ABORT: kernel mismatch — running [" + lastKernelRelease
+                        + "], profile needs [" + EXPECTED_KERNEL_RELEASE + "]");
+                lastVerdict = -1;
+                lastRound = 0;
+                lastReason = "kernel-mismatch:" + lastKernelRelease;
+                log(callback, "exit=-4");
+                return;
+            }
+            log(callback, "kernel ok: " + lastKernelRelease);
+
+            /* v38 (RootFamiliar EnvProbe 借鉴): 工作区可用性一探到底，
+             * 结果进 verdict —— 失败现场不再靠猜。 */
+            lastEnv = envProbe();
+            log(callback, "env probe: " + lastEnv);
+
             /* v29: PC autoroot's FIRST action every cycle is root_ok — if
              * root is already live on this boot it exits without attacking.
              * The App lacked this gate: the 11-01 10:26 reset happened when a
@@ -272,6 +308,9 @@ public class RootUserService extends IRootRunner.Stub {
                     /* v35: W1c 摘除去证 —— already-rooted 路径同样验证 */
                     lastVrDisarmed = vrDisarmProbe();
                     log(callback, "vr_disarmed=" + lastVrDisarmed + " (W1c dmesg evidence)");
+                    /* v38 (RootFamiliar ManagerProbe.uapi 借鉴): ksud uapi 守卫 */
+                    lastUapi = uapiGuard(callback);
+                    log(callback, "uapi=" + lastUapi);
                 } else {
                     log(callback, "仅检测到 KSU 模块、身份未验证 —— 不要打开管理器，"
                             + "先确认补丁状态（PC: su -c sh /data/local/tmp/fix.sh）");
@@ -437,6 +476,10 @@ public class RootUserService extends IRootRunner.Stub {
         sb.append("magica=").append(lastMagica).append('\n');
         /* v35: DirtyFrag-vr W1c 摘除去证（1/0/unknown） */
         sb.append("vr_disarmed=").append(lastVrDisarmed).append('\n');
+        /* v38: RootFamiliar 借鉴三件套 —— 内核校验/环境探测/uapi 守卫 */
+        sb.append("krn=").append(lastKernelRelease).append('\n');
+        sb.append("env=").append(lastEnv).append('\n');
+        sb.append("uapi=").append(lastUapi).append('\n');
         sb.append("reason=").append(lastReason).append('\n');
         writeLine(VERDICT_FILE, sb.toString(), false);
     }
@@ -477,6 +520,9 @@ public class RootUserService extends IRootRunner.Stub {
              * sys_exit 探针，dmesg 的 "W1c vr sys_exit probe disarmed" 是唯一证据行 */
             lastVrDisarmed = vrDisarmProbe();
             log(callback, "vr_disarmed=" + lastVrDisarmed + " (W1c dmesg evidence)");
+            /* v38 (RootFamiliar ManagerProbe.uapi 借鉴): ksud uapi 守卫 */
+            lastUapi = uapiGuard(callback);
+            log(callback, "uapi=" + lastUapi);
             log(callback, "SUCCESS (root verified) in round " + round
                     + ": enforce=" + enforce + " ksu=" + ksu);
         } else {
@@ -663,6 +709,103 @@ public class RootUserService extends IRootRunner.Stub {
      * "W1c vr sys_exit probe disarmed"（one.sh v5 摘除动作的唯一指纹行）。
      * 返回 "1"（已摘除）/ "0"（dmesg 可读但无此行）/ "unknown"（dmesg 不可读）。
      * 注意：shell 域读 dmesg 受限时绝不能误报 0，必须落 unknown。 */
+    /** v38 (RootFamiliar EnvProbe 借鉴): 工作区可用性探测，shell 身份即可做。
+     * 产出紧凑摘要 —— tmp 可写+可执行 / adb 可读 / kallsyms 是否被 kptr_restrict
+     * 归零。任何一项异常都会写进 verdict，失败现场不用再猜。 */
+    private String envProbe() {
+        StringBuilder sb = new StringBuilder();
+        /* tmp: 写+执行双测 —— 只能写不能执行的沙箱会把整条链路卡死 */
+        boolean w = false, x = false;
+        try {
+            File probe = new File(TMP, ".gr_envprobe.sh");
+            writeLine(probe.getAbsolutePath(), "#!/system/bin/sh\necho GR_ENV_OK", false);
+            probe.setExecutable(true, false);
+            java.lang.Process p = new ProcessBuilder(probe.getAbsolutePath()).start();
+            boolean done = p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
+            String out = "";
+            if (done) {
+                byte[] b = new byte[64];
+                int n = p.getInputStream().read(b);
+                out = n > 0 ? new String(b, 0, n) : "";
+            }
+            x = done && out.contains("GR_ENV_OK");
+            w = probe.isFile();
+            probe.delete();
+        } catch (Throwable ignored) {
+        }
+        sb.append("tmp:").append(w ? "w" : "-").append(x ? "x" : "-");
+        /* adb: vivo LSM 对 /data/adb 的访问是间歇的，只读探测记录现状 */
+        File adb = new File("/data/adb");
+        sb.append(" adb:").append(adb.canRead() ? "r" : "-");
+        /* kallsyms: kptr_restrict 归零时地址列全 0，root 前只能确认这个 */
+        String ks = readText("/proc/kallsyms");
+        if (ks.isEmpty()) {
+            sb.append(" kallsyms:-");
+        } else {
+            boolean zeroed = ks.contains(" 0000000000000000 ");
+            sb.append(" kallsyms:").append(zeroed ? "restricted" : "full");
+        }
+        return sb.toString();
+    }
+
+    /** v38 (RootFamiliar ManagerProbe.uapi 借鉴): ksud uapi 守卫。读
+     * /data/adb/ksud -V 的 "(uapi: N)"，与内核期望不符时自动换装
+     * /data/local/tmp/ksud-gk（uapi:5）。直写被 vivo LSM 拒时退到
+     * b0 atcid_vendor_socket 通道（2026-11-02 实测可用）。尽力而为，
+     * 失败只记录不阻塞 —— 换装失败只影响后续模块安装，不影响 root。 */
+    private String uapiGuard(ILogCallback callback) {
+        try {
+            ShellResult v = rootShell("/data/adb/ksud -V 2>/dev/null", 15);
+            int uapi = parseUapi(v.ok() ? v.out : "");
+            if (uapi == EXPECTED_KSUD_UAPI) {
+                return "uapi" + uapi + "-ok";
+            }
+            if (!new File(TMP, "ksud-gk").isFile()) {
+                return "uapi" + uapi + "-mismatch-no-gk";
+            }
+            log(callback, "uapi guard: /data/adb/ksud is uapi" + uapi
+                    + ", kernel needs uapi" + EXPECTED_KSUD_UAPI + " — swapping");
+            /* 直写（root 窗口内通常可行） */
+            ShellResult s1 = rootShell(
+                    "cp -f /data/adb/ksud /data/adb/ksud-uapi2.bak 2>/dev/null; "
+                            + "cp -f /data/local/tmp/ksud-gk /data/adb/ksud && "
+                            + "chmod 755 /data/adb/ksud", 20);
+            int after = parseUapi(rootShell("/data/adb/ksud -V 2>/dev/null", 15).out);
+            if (after == EXPECTED_KSUD_UAPI) {
+                return "uapi" + uapi + "-to-" + after;
+            }
+            /* b0 通道兜底（vivo LSM 防篡改拦直写时） */
+            log(callback, "uapi guard: direct swap failed, trying b0 channel");
+            writeLine(new File(TMP, ".uapi_swap.sh").getAbsolutePath(),
+                    "#!/system/bin/sh\n"
+                            + "cp -f /data/adb/ksud /data/adb/ksud-uapi2.bak 2>/dev/null\n"
+                            + "cp -f /data/local/tmp/ksud-gk /data/adb/ksud\n"
+                            + "chmod 755 /data/adb/ksud\n"
+                            + "/data/adb/ksud -V\n", false);
+            ShellResult s2 = rootShell(
+                    "/data/local/tmp/b0 atcid_vendor_socket "
+                            + "'sh /data/local/tmp/.uapi_swap.sh' >/dev/null 2>&1; sleep 2; "
+                            + "/data/adb/ksud -V 2>/dev/null", 30);
+            int after2 = parseUapi(s2.out);
+            if (after2 == EXPECTED_KSUD_UAPI) {
+                return "uapi" + uapi + "-to-" + after2 + "-via-b0";
+            }
+            return "uapi" + uapi + "-mismatch-swap-failed";
+        } catch (Throwable e) {
+            return "guard-error";
+        }
+    }
+
+    /** v38: 从 ksud -V 输出解析 "(uapi: N)"，读不到返回 -1。 */
+    private static int parseUapi(String out) {
+        if (out == null) {
+            return -1;
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\\(uapi:\\s*(\\d+)\\)").matcher(out);
+        return m.find() ? Integer.parseInt(m.group(1)) : -1;
+    }
+
     private String vrDisarmProbe() {
         ShellResult r = rootShell("dmesg", 30);
         if (r.timedOut || !r.ok()) {
