@@ -194,6 +194,20 @@ public class GhostRootService extends Service {
         return START_NOT_STICKY;
     }
 
+    @Override
+    public void onDestroy() {
+        /* v39: 前台服务销毁时解除 Shizuku UserService 绑定 —— 此前旧
+         * connection 跨实例泄漏、长期占住已完成的 UserService 进程。
+         * 用 stop=false：任务中途被系统回收时绝不主动杀掉正在执行的
+         * UserService；残余进程由下一次 beginRun 的 unbind(stop=true)
+         * 统一回收。 */
+        try {
+            Shizuku.unbindUserService(serviceArgs, connection, false);
+        } catch (Throwable ignored) {
+        }
+        super.onDestroy();
+    }
+
     /** 手动触发的唯一执行入口。 */
     private void beginRun() {
         if (running) {
@@ -230,6 +244,13 @@ public class GhostRootService extends Service {
         sessionId = sessionStartTs + "-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         emit("Shizuku 就绪，绑定 root 服务… (session=" + sessionId + ")");
         try {
+            /* v39 (存量问题一并修复): 先停掉已挂载的旧 UserService —— 同版本
+             * bind 会复用旧进程实例，上一任务的状态（旧 callback 绑定、过程内
+             * 残留状态）会被带进新任务。unbindUserService(..., stop=true) 解绑
+             * 同时让 Shizuku 停掉旧进程，随后 bind 起干净的新实例。
+             * 首次启动无挂载实例时此调用是无害的 no-op。 */
+            Shizuku.unbindUserService(serviceArgs, connection, true);
+            runner = null;
             Shizuku.bindUserService(serviceArgs, connection);
         } catch (Throwable t) {
             emit("bind failed: " + t);
