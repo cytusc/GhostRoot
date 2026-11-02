@@ -47,7 +47,9 @@ ensure_fire() {
 
 # ---- 借鉴 1: checkKernel —— 开火前硬校验（每 boot 一次） ----
 check_kernel() {
-  KR=$(a shell 'cat /proc/sys/kernel/osrelease 2>/dev/null' | tr -d '\r\n')
+  # 注意：/proc/sys/kernel/osrelease 在本机被 vivo 策略禁读（Permission denied），
+  # 只有 uname -r 可用 —— 别改成 cat。
+  KR=$(a shell 'uname -r 2>/dev/null' | tr -d '\r\n')
   if [ "$KR" != "$EXPECTED_KERNEL" ]; then
     log "[X] checkKernel FAIL: running [$KR] expected [$EXPECTED_KERNEL] — refusing to fire"
     return 1

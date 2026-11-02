@@ -257,7 +257,9 @@ public class RootUserService extends IRootRunner.Stub {
             /* v38 (RootFamiliar checkKernel 借鉴): 先确认内核再开火。
              * profile.bin 的符号地址只对这一个内核有效 —— OTA/换内核后
              * 乱开火就是给 vr.ko 送采样。 */
-            lastKernelRelease = readText("/proc/sys/kernel/osrelease").trim();
+            /* v39: /proc/sys/kernel/osrelease 被 vivo 策略禁读（Permission denied），
+             * 只有 uname -r 可用 —— 别改回 readText。 */
+            lastKernelRelease = plainShell("uname -r", 10).out.trim();
             if (!EXPECTED_KERNEL_RELEASE.equals(lastKernelRelease)) {
                 log(callback, "ABORT: kernel mismatch — running [" + lastKernelRelease
                         + "], profile needs [" + EXPECTED_KERNEL_RELEASE + "]");
