@@ -19,6 +19,9 @@ log() { echo "[$(date +%T)] $*"; }
 MAXCYC=${1:-8}
 CAP=${2:-90}
 ATT=${3:-3}
+# 命中窗口：2026-11-02 两次成功都在 uptime 29s / 36s 开火。
+# 太早（<25s）系统还在 churn，太晚页污染。瞄准 32s 附近再开火。
+FIRE_AT=${4:-32}
 EXPECTED_KERNEL="5.15.197-g346b1c36bd5c-dirty"
 EXPECTED_UAPI=5
 
@@ -49,7 +52,17 @@ ensure_fire() {
 check_kernel() {
   # 注意：/proc/sys/kernel/osrelease 在本机被 vivo 策略禁读（Permission denied），
   # 只有 uname -r 可用 —— 别改成 cat。
-  KR=$(a shell 'uname -r 2>/dev/null' | tr -d '\r\n')
+  # 刚开机时 adbd 可能还没稳，uname 会返回空串 —— 重试，不能当"内核不符"。
+  KR=""
+  for t in 1 2 3 4 5 6 7 8 9 10; do
+    KR=$(a shell 'uname -r 2>/dev/null' | tr -d '\r\n')
+    [ -n "$KR" ] && break
+    sleep 2
+  done
+  if [ -z "$KR" ]; then
+    log "checkKernel: adb unstable (uname empty after retries) — skip this cycle"
+    return 2
+  fi
   if [ "$KR" != "$EXPECTED_KERNEL" ]; then
     log "[X] checkKernel FAIL: running [$KR] expected [$EXPECTED_KERNEL] — refusing to fire"
     return 1
@@ -85,7 +98,7 @@ uapi_guard() {
   fi
   log "uapi guard: direct swap failed, trying b0 channel"
   a shell 'printf "%s\n" "#!/system/bin/sh" "cp -f /data/adb/ksud /data/adb/ksud-uapi2.bak 2>/dev/null" "cp -f /data/local/tmp/ksud-gk /data/adb/ksud" "chmod 755 /data/adb/ksud" > /data/local/tmp/.uapi_swap.sh; chmod 755 /data/local/tmp/.uapi_swap.sh' >/dev/null 2>&1
-  a shell 'su -c "/data/local/tmp/b0 atcid_vendor_socket \"sh /data/local/tmp/.uapi_swap.sh\" >/dev/null 2>&1; sleep 2; /data/adb/ksud -V 2>/dev/null"' 2>/dev/null | grep -q "uapi: $EXPECTED_UAPI" \
+  a shell 'su -c "/data/local/tmp/b0 atcid_vendor_socket \"sh /data/local/tmp/.uapi_swap.sh #seedkeeper_client\" >/dev/null 2>&1; sleep 2; /data/adb/ksud -V 2>/dev/null"' 2>/dev/null | grep -q "uapi: $EXPECTED_UAPI" \
     && log "uapi guard: swapped via b0 channel" \
     || log "uapi guard: swap FAILED (uapi$U) — 模块安装前需手动处理"
 }
@@ -97,7 +110,14 @@ for cycle in $(seq 1 "$MAXCYC"); do
   wait_boot || { log "no device; abort"; exit 1; }
   UPT=$(a shell 'cut -d. -f1 /proc/uptime' 2>/dev/null | tr -d '\r\n')
   log "boot uptime=${UPT}s"
-  check_kernel || exit 3
+  check_kernel
+  KRC=$?
+  if [ "$KRC" = "1" ]; then exit 3; fi
+  if [ "$KRC" = "2" ]; then
+    a reboot >/dev/null 2>&1
+    sleep 8
+    continue
+  fi
   env_probe
   if root_ok; then
     log "=== ROOT OK (boot had root) ==="
@@ -105,6 +125,13 @@ for cycle in $(seq 1 "$MAXCYC"); do
     exit 0
   fi
   ensure_fire
+
+  # 瞄准窗口（数据驱动：今天两次成功都在 29s / 36s 开火）
+  if [ "$UPT" -lt "$FIRE_AT" ] 2>/dev/null; then
+    W=$((FIRE_AT - UPT))
+    log "aim window: uptime=${UPT}s < ${FIRE_AT}s, waiting ${W}s"
+    sleep "$W"
+  fi
 
   # ---- 借鉴 4: 同 boot 连抽 ATT 次官方（失败 rc=1 仅 ~8s，不复位就再来） ----
   hit=0

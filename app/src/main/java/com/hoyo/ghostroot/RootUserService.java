@@ -98,6 +98,11 @@ public class RootUserService extends IRootRunner.Stub {
 
     private final Context context;
     private final AtomicBoolean running = new AtomicBoolean(false);
+    /** v39: kmsg 采集器可管理句柄 —— 此前线程/logcat 子进程即起即弃，任务
+     * 收尾无法回收、重复启动会叠加采集器（review 2026-11-02 确认的缺陷）。 */
+    private Thread kmsgFollowerThread;
+    private java.lang.Process kmsgFollowerProcess;
+    private volatile boolean kmsgFollowerStop;
     /* v26: verdict accumulator — set by every exit path, flushed to
      * VERDICT_FILE exactly once in finally(). MIN_VALUE = "not set yet". */
     private int lastVerdict = Integer.MIN_VALUE;
@@ -441,6 +446,9 @@ public class RootUserService extends IRootRunner.Stub {
                 lastReason = "exception:" + t.getClass().getSimpleName();
             }
         } finally {
+            /* v39: 任务收尾回收 kmsg 采集器（线程 + logcat 子进程）—— 此前
+             * 无句柄无回收，UserService 存活期间多次任务会残留/叠加采集器 */
+            stopKmsgFollower();
             /* v26: flush the final verdict — this is the file the app-side
              * service reads, and the ONLY place success can come from.
              * Every path above either set lastVerdict or left MIN_VALUE,
@@ -678,33 +686,122 @@ public class RootUserService extends IRootRunner.Stub {
      * 不放行，实测 Permission denied）→ 改走 logd 代理：`logcat -b kernel -v raw`
      * 持续流式读取（logd 以特权身份读 kmsg，shell→logd socket 放行）。
      * 每行落盘后 FileDescriptor.sync() 强推 —— watchdog 复位不经过正常关机也
-     * 留得住复位前的内核日志。上限 16MB 防无限增长；UserService 进程死亡时线程随进程消亡。 */
+     * 留得住复位前的内核日志。
+     * v39 修复（review 2026-11-02 三项）：
+     *  1) 线程/子进程句柄存为字段，启动前与任务收尾都先 stopKmsgFollower ——
+     *     UserService 存活期间多次调用不再叠加采集器；
+     *  2) 达到 16MB 滚动成 .1 后继续采集（旧行为达上限后只写标记不再读正文，
+     *     后续故障现场全部丢失）；
+     *  3) "已启动"提示改为收到首行内核日志后才确认；进程早退且从未读到数据时
+     *     显式上报，采集失败不再被误认为正常。 */
     private void startKmsgFollower(ILogCallback callback) {
         final String KMSG_LOG = "/data/local/tmp/ghostroot-kmsg.log";
         final long MAX_BYTES = 16L * 1024 * 1024;
-        Thread t = new Thread(() -> {
-            try (java.io.BufferedReader in = new java.io.BufferedReader(
-                    new InputStreamReader(new java.lang.ProcessBuilder(
-                            "logcat", "-b", "kernel", "-v", "raw").start().getInputStream()));
-                 java.io.FileOutputStream out = new java.io.FileOutputStream(KMSG_LOG, true)) {
-                out.write(("=== kmsg follower start ts=" + System.currentTimeMillis() / 1000
-                        + " uptime=" + readUptime() + "s ===\n").getBytes());
-                out.getFD().sync();
-                String ln;
-                while (out.getChannel().size() < MAX_BYTES && (ln = in.readLine()) != null) {
-                    out.write((ln + "\n").getBytes());
-                    out.getFD().sync();   // per-line fsync — the whole point
-                }
-            } catch (Throwable e) {
-                try {
-                    log(callback, "kmsg follower ended: " + e);
-                } catch (Exception ignored) {
-                }
+        /* v39: 幂等 —— 先回收可能残留的旧采集器，再起一个新的 */
+        stopKmsgFollower();
+        try {
+            /* v39 rotation: 文件已到上限则先滚动成 .1，从新文件开始采集 */
+            File f = new File(KMSG_LOG);
+            if (f.length() >= MAX_BYTES) {
+                File rot = new File(KMSG_LOG + ".1");
+                rot.delete();
+                log(callback, "kmsg log rotated: " + f.length() + " bytes -> "
+                        + rot.getName());
+                f.renameTo(rot);
             }
-        }, "kmsg-follower");
-        t.setDaemon(true);
-        t.start();
-        log(callback, "kmsg follower started (logcat -b kernel) -> " + KMSG_LOG);
+            kmsgFollowerStop = false;
+            kmsgFollowerProcess = new java.lang.ProcessBuilder(
+                    "logcat", "-b", "kernel", "-v", "raw").start();
+            final java.lang.Process proc = kmsgFollowerProcess;
+            final AtomicBoolean firstData = new AtomicBoolean(false);
+            Thread t = new Thread(() -> {
+                try (java.io.BufferedReader in = new java.io.BufferedReader(
+                        new InputStreamReader(proc.getInputStream()))) {
+                    java.io.FileOutputStream out = openKmsgOut(KMSG_LOG);
+                    try {
+                        String ln;
+                        while (!kmsgFollowerStop && (ln = in.readLine()) != null) {
+                            /* v39 rotation: 落盘途中达上限也滚动 .1 继续采集 */
+                            if (out.getChannel().size() >= MAX_BYTES) {
+                                out.close();
+                                File rot = new File(KMSG_LOG + ".1");
+                                rot.delete();
+                                new File(KMSG_LOG).renameTo(rot);
+                                out = openKmsgOut(KMSG_LOG);
+                            }
+                            if (firstData.compareAndSet(false, true)) {
+                                log(callback, "kmsg follower confirmed: first kernel line received");
+                            }
+                            out.write((ln + "\n").getBytes());
+                            out.getFD().sync();   // per-line fsync — the whole point
+                        }
+                    } finally {
+                        try {
+                            out.close();
+                        } catch (Exception ignored) {
+                        }
+                    }
+                } catch (Throwable e) {
+                    if (!kmsgFollowerStop) {
+                        try {
+                            log(callback, "kmsg follower ended: " + e);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                } finally {
+                    /* v39: 进程早退且从未读到数据 —— 显式上报，
+                     * 不能用日志为空排除系统异常 */
+                    if (!firstData.get() && !kmsgFollowerStop) {
+                        try {
+                            log(callback, "kmsg follower WARNING: no kernel data received"
+                                    + " (check `logcat -b kernel` availability)");
+                        } catch (Exception ignored) {
+                        }
+                    }
+                }
+            }, "kmsg-follower");
+            t.setDaemon(true);
+            kmsgFollowerThread = t;
+            t.start();
+            /* v39: 措辞改为"launching" —— 确认以收到首行为准，见 confirmed 行 */
+            log(callback, "kmsg follower launching (logcat -b kernel) -> " + KMSG_LOG);
+        } catch (Throwable e) {
+            /* v39: spawn 失败必须说清楚，不能只报已启动 */
+            try {
+                log(callback, "kmsg follower start FAILED: " + e);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /** v39: 打开（或滚动后重开）kmsg 日志文件，写开始标记并强推落盘。 */
+    private java.io.FileOutputStream openKmsgOut(String path) throws java.io.IOException {
+        java.io.FileOutputStream out = new java.io.FileOutputStream(path, true);
+        out.write(("=== kmsg follower start ts=" + System.currentTimeMillis() / 1000
+                + " uptime=" + readUptime() + "s ===\n").getBytes());
+        out.getFD().sync();
+        return out;
+    }
+
+    /** v39: 回收 kmsg 采集器 —— 置停止标志并 destroy logcat 子进程让
+     * readLine 尽快返回，join 收线程。幂等，可重复调用（含并发自调用防护：
+     * 采集线程自身不会走到这里）。 */
+    private void stopKmsgFollower() {
+        kmsgFollowerStop = true;
+        java.lang.Process p = kmsgFollowerProcess;
+        kmsgFollowerProcess = null;
+        if (p != null) {
+            p.destroy();
+        }
+        Thread t = kmsgFollowerThread;
+        kmsgFollowerThread = null;
+        if (t != null && Thread.currentThread() != t) {
+            try {
+                t.join(2000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /** v35: DirtyFrag-vr W1c 摘除去证 —— root 活着时读 dmesg 找
@@ -786,7 +883,7 @@ public class RootUserService extends IRootRunner.Stub {
                             + "/data/adb/ksud -V\n", false);
             ShellResult s2 = rootShell(
                     "/data/local/tmp/b0 atcid_vendor_socket "
-                            + "'sh /data/local/tmp/.uapi_swap.sh' >/dev/null 2>&1; sleep 2; "
+                            + "'sh /data/local/tmp/.uapi_swap.sh #seedkeeper_client' >/dev/null 2>&1; sleep 2; "
                             + "/data/adb/ksud -V 2>/dev/null", 30);
             int after2 = parseUapi(s2.out);
             if (after2 == EXPECTED_KSUD_UAPI) {
