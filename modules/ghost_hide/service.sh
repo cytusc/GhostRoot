@@ -1,6 +1,8 @@
 #!/system/bin/sh
-# Ghost Hide v0.5 — 定向 root 屏蔽（开机一次性，KSU late-load 后执行，零守护进程）
+# Ghost Hide v0.6 — 定向 root 屏蔽（开机一次性，KSU late-load 后执行，零守护进程）
 #
+# v0.6（2026-11-02）：探针清单扩到 vivo 系统服务类——智慧服务(aiengine)/
+#   vivo服务守护宿主(daemonService)/SmartService/AI服务/安全中心/安全组件。
 # v0.5 范围修正（2026-11-02 用户定案，替换 v0.4 的宽范围）：
 #   - App 级定向：只屏蔽 银行类 / 支付类 / 聊天类（购物类移出——它们
 #     由 KSU 内核默认拒绝兜底即可，不做定向处理）
@@ -31,14 +33,20 @@ com.chinamworld.bocmbci       # 中国银行
 cmb.pb                        # 招商银行
 "
 
-# vivo 反 root 探针定向清单（v0.5 新增：系统级只管这些）
+# vivo 反 root 探针定向清单（v0.6：+系统服务类——智慧服务/守护宿主/AI服务等）
 VIVO_PROBE_PKGS="
 com.iqoo.secure               # i管家（vivo 安全中心，root 检测主力）
 com.vivo.permissionmanager    # vivo 权限管理
+com.vivo.aiengine             # 智慧服务（i 引擎服务，zh 标签已验证）
+com.vivo.daemonService        # vivo服务（守护进程宿主，探针常挂此处）
+com.vivo.smartservice         # SmartService 智慧服务
+com.vivo.aiservice            # vivo AI 服务
+com.vivo.safecenter           # vivo 安全中心
+com.vivo.vmdri                # vivo 安全组件
 "
 
 {
-echo "=== ghost_hide v0.5 $(date) ==="
+echo "=== ghost_hide v0.6 $(date) ==="
 
 # ---- A. 非 KSU su 残留兜底（硬底线，天然全局）----
 for p in /system/xbin/su /sbin/su /su/bin/su /vendor/bin/su /system/app/Superuser.apk; do
