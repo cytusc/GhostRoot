@@ -967,7 +967,7 @@ public class RootUserService extends IRootRunner.Stub {
             }
             writeLine(ZN_SOFTREBOOT_MARK, "ts=" + System.currentTimeMillis() / 1000
                     + " uptime=" + readUptime() + "s zygotes=" + zygotes + "\n", false);
-            rootShell("setsid sh -c 'sleep 3; stop; sleep 4; start' "
+            rootShell("setsid sh -c 'sleep 6; stop; sleep 4; start' "
                     + ">/dev/null 2>&1 </dev/null &", 8);
             log(callback, "zygisk: zygote NOT hooked (late-load race) -> framework soft reboot "
                     + "scheduled; ZN will catch the fresh zygote (~40s)");
