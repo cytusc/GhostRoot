@@ -78,6 +78,17 @@ public class RootUserService extends IRootRunner.Stub {
     private static final String EXPECTED_KERNEL_RELEASE = "5.15.197-g346b1c36bd5c-dirty";
     /** v38: 本机内核的 ksud uapi（2026-11-01 ksud-gk 配平实测）。 */
     private static final int EXPECTED_KSUD_UAPI = 5;
+    /* v41: ZygiskNext late-load 自愈 —— bootloader 锁死导致 KSU 只能靠 exploit
+     * 事后注入，zygote 永远早于 root 启动，ZN 的 zygote 注入竞态必输：表现
+     * 为 HMA-OSS / LSPosed 全部"模块未激活"（2026-11-02 实测根因）。
+     * 解法：单例 zn-daemon + framework 软重启（stop/start，~40s，KSU 内核
+     * 模块与 Permissive 状态不受影响），让 daemon 捕获新 zygote —— 实测
+     * zygote_states 0→2，HMA 状态目录 status.json 随即出现。 */
+    private static final String ZN_MODDIR = "/data/adb/modules/zygisksu";
+    private static final String ZN_BIN = ZN_MODDIR + "/bin/zygiskd";
+    private static final String ZN_SOFTREBOOT_MARK = "/data/local/tmp/.gr_zn_softreboot";
+    /** 同一 boot 内软重启只做一次：20 分钟内重复请求视为"上次没救活"，不再打扰用户。 */
+    private static final int ZN_SOFTREBOOT_COOLDOWN_MIN = 20;
     private static final String ASSET_LIB = "libksud-fixed.so";
     private static final String ASSET_FIX = "fix.sh";
     private static final String FIXED_LIB_MD5 = "2c84145e3efb6f7f045fef3ed1eea4c6";
@@ -123,6 +134,9 @@ public class RootUserService extends IRootRunner.Stub {
     /** v38 (RootFamiliar ManagerProbe.uapi 借鉴): /data/adb/ksud 的 (uapi: N)
      * 与内核 uapi 不匹配时自动换装 /data/local/tmp/ksud-gk（含 b0 通道兜底）。 */
     private String lastUapi = "not-checked";
+    /** v41: ZygiskNext 激活结果 —— zn-ok-zygoteN / zn-softreboot-scheduled /
+     * zn-zygote0-softreboot-cooldown(Nm) / zn-absent / zn-error:*。 */
+    private String lastZn = "not-run";
     /** v27: this session's own log file (never overwritten by the next run). */
     private String currentSessionFile;
     /** v33: 当前会话 ID（服务端下发）。verdict 文件会带上 session= 字段，
@@ -318,6 +332,10 @@ public class RootUserService extends IRootRunner.Stub {
                     /* v38 (RootFamiliar ManagerProbe.uapi 借鉴): ksud uapi 守卫 */
                     lastUapi = uapiGuard(callback);
                     log(callback, "uapi=" + lastUapi);
+                    /* v41: ZygiskNext 自愈（HMA-OSS/LSPosed 激活）—— 放最后，
+                     * 万一触发软重启也不影响前面的取证与守卫步骤 */
+                    lastZn = zygiskAutoActivate(callback);
+                    log(callback, "zygisk=" + lastZn);
                 } else {
                     log(callback, "仅检测到 KSU 模块、身份未验证 —— 不要打开管理器，"
                             + "先确认补丁状态（PC: su -c sh /data/local/tmp/fix.sh）");
@@ -490,6 +508,8 @@ public class RootUserService extends IRootRunner.Stub {
         sb.append("krn=").append(lastKernelRelease).append('\n');
         sb.append("env=").append(lastEnv).append('\n');
         sb.append("uapi=").append(lastUapi).append('\n');
+        /* v41: ZygiskNext 激活结果（zn-ok-zygoteN / zn-softreboot-scheduled / ...） */
+        sb.append("zn=").append(lastZn).append('\n');
         sb.append("reason=").append(lastReason).append('\n');
         writeLine(VERDICT_FILE, sb.toString(), false);
     }
@@ -533,6 +553,10 @@ public class RootUserService extends IRootRunner.Stub {
             /* v38 (RootFamiliar ManagerProbe.uapi 借鉴): ksud uapi 守卫 */
             lastUapi = uapiGuard(callback);
             log(callback, "uapi=" + lastUapi);
+            /* v41: ZygiskNext 自愈（HMA-OSS/LSPosed 激活）—— 放最后，
+             * 万一触发软重启也不影响前面的取证与守卫步骤 */
+            lastZn = zygiskAutoActivate(callback);
+            log(callback, "zygisk=" + lastZn);
             log(callback, "SUCCESS (root verified) in round " + round
                     + ": enforce=" + enforce + " ksu=" + ksu);
         } else {
@@ -903,6 +927,80 @@ public class RootUserService extends IRootRunner.Stub {
         java.util.regex.Matcher m = java.util.regex.Pattern
                 .compile("\\(uapi:\\s*(\\d+)\\)").matcher(out);
         return m.find() ? Integer.parseInt(m.group(1)) : -1;
+    }
+
+    /** v41: ZygiskNext 自动激活（late-load 自愈）。
+     * 判据与动作：`zygiskd status` 的 zygote_states>0 才算注入成功；
+     * 未注入时先把 zn-daemon 收敛成单例（多实例会互抢 ptrace 注入），
+     * 再安排一次 framework 软重启（stop/start）让 daemon 捕获新 zygote。
+     * 软重启命令用 setsid 脱离 App 进程组 —— stop 会杀光 App 进程，
+     * 重启链必须活过 App 的死亡（root 域进程不受 AM 管理）。
+     * 同 boot 防死循环：20 分钟内只安排一次。 */
+    private String zygiskAutoActivate(ILogCallback callback) {
+        try {
+            ShellResult st = rootShell(ZN_BIN + " status 2>/dev/null", 20);
+            if (st.timedOut || !st.ok()) {
+                /* 模块不存在 / 状态不可读 —— 不动系统 */
+                return "zn-absent";
+            }
+            int zygotes = parseFieldInt(st.out, "zygote_states");
+            int daemons = pidCount("zn-daemon");
+            log(callback, "zygisk: zygote_states=" + zygotes + " zn-daemon=" + daemons);
+            if (daemons != 1) {
+                rootShell("for p in $(pidof zn-daemon); do kill $p 2>/dev/null; done; "
+                        + "sleep 1", 15);
+                rootShell("cd " + ZN_MODDIR + " && setsid nohup ./bin/zygiskd daemon "
+                        + ">/dev/null 2>&1 </dev/null &", 10);
+                Thread.sleep(2000);
+                daemons = pidCount("zn-daemon");
+                log(callback, "zygisk: single-instance daemon -> zn-daemon=" + daemons);
+            }
+            if (zygotes > 0 && daemons >= 1) {
+                return "zn-ok-zygote" + zygotes;
+            }
+            File mark = new File(ZN_SOFTREBOOT_MARK);
+            long ageMin = mark.isFile()
+                    ? (System.currentTimeMillis() - mark.lastModified()) / 60000L
+                    : Long.MAX_VALUE;
+            if (ageMin < ZN_SOFTREBOOT_COOLDOWN_MIN) {
+                return "zn-zygote0-softreboot-cooldown(" + ageMin + "m)";
+            }
+            writeLine(ZN_SOFTREBOOT_MARK, "ts=" + System.currentTimeMillis() / 1000
+                    + " uptime=" + readUptime() + "s zygotes=" + zygotes + "\n", false);
+            rootShell("setsid sh -c 'sleep 3; stop; sleep 4; start' "
+                    + ">/dev/null 2>&1 </dev/null &", 8);
+            log(callback, "zygisk: zygote NOT hooked (late-load race) -> framework soft reboot "
+                    + "scheduled; ZN will catch the fresh zygote (~40s)");
+            return "zn-softreboot-scheduled";
+        } catch (Throwable e) {
+            return "zn-error:" + e.getClass().getSimpleName();
+        }
+    }
+
+    /** v41: pidof 计数（0=未运行）。zn-daemon 是 zygiskd 的进程名 —— 按
+     * "zygiskd" grep 永远查不到，这是 2026-11-02 排查踩过的坑。 */
+    private int pidCount(String name) {
+        ShellResult r = rootShell("pidof " + name + " 2>/dev/null", 10);
+        String o = r.out.trim();
+        return o.isEmpty() ? 0 : o.split("\\s+").length;
+    }
+
+    /** v41: 解析 "key:value" 行的整数值，缺失/非法返回 -1。 */
+    private static int parseFieldInt(String text, String key) {
+        if (text == null) {
+            return -1;
+        }
+        for (String line : text.split("\n")) {
+            int i = line.indexOf(key + ":");
+            if (i >= 0) {
+                try {
+                    return Integer.parseInt(line.substring(i + key.length() + 1).trim());
+                } catch (NumberFormatException ignored) {
+                    return -1;
+                }
+            }
+        }
+        return -1;
     }
 
     private String vrDisarmProbe() {

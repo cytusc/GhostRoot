@@ -173,7 +173,7 @@ public class GhostRootService extends Service {
                 .daemon(false)
                 .processNameSuffix("root")
                 .debuggable(false)
-                .version(29);
+                .version(30);
     }
 
     @Override
@@ -325,6 +325,7 @@ public class GhostRootService extends Service {
                     + (pv.krn == null || pv.krn.isEmpty() ? "" : " krn=" + pv.krn)
                     + (pv.env == null || pv.env.isEmpty() ? "" : " env=" + pv.env)
                     + (pv.uapi == null || pv.uapi.isEmpty() ? "" : " uapi=" + pv.uapi)
+                    + (pv.zn == null || pv.zn.isEmpty() ? "" : " zygisk=" + pv.zn)
                     + " reason=" + pv.reason;
         } else if (code == -3) {
             verdict = 1;
@@ -395,6 +396,7 @@ public class GhostRootService extends Service {
         String krn;
         String env;
         String uapi;
+        String zn;
         String reason;
         String session;
     }
@@ -424,6 +426,7 @@ public class GhostRootService extends Service {
                     case "krn": pv.krn = v; break;
                     case "env": pv.env = v; break;
                     case "uapi": pv.uapi = v; break;
+                    case "zn": pv.zn = v; break;
                     case "session": pv.session = v; break;
                     case "reason": pv.reason = v; break;
                     default: break;
