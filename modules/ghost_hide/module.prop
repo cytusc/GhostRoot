@@ -1,6 +1,6 @@
 id=ghost_hide
-name=Ghost Hide (Root 兜底屏蔽)
-version=0.4
-versionCode=4
+name=Ghost Hide (定向 root 屏蔽)
+version=0.5
+versionCode=5
 author=GhostRoot project
-description=系统级 root 兜底屏蔽（零守护进程）：非 KSU 的 su 残留一律 chmod 000、/proc/modules 440、root 授权审计（系统级/vivo 探针包/敏感包持 root 即告警）、反干扰守卫、敏感 App（银行/支付/购物/社交支付）定向加固审计、自同步通道（/data/local/tmp/ghost-module-sync 开机落地绕开 LSM 封锁）。细粒度按应用屏蔽由 HMA + ZygiskNext denylist 负责，环境伪装由 bszip 悲伤一键负责，本模块是全局底线且绝不触碰网络
+description=定向 root 屏蔽（零守护进程）v0.5 范围收窄：App 级只定向银行/支付/聊天类（购物类移出，由 KSU 内核默认拒绝兜底）；系统级只针对 vivo 反root探针（i管家/权限管理等安全包定向审计+ZN denylist 尝试）。保留两条全局硬底线：非 KSU 的 su 残留 chmod 000、/proc/modules 440。root 授权审计（vivo/bbk/iqoo 包持 root 即告警）、反干扰守卫、自同步通道。网络由 vivo_net_fix 负责，本模块绝不触碰
