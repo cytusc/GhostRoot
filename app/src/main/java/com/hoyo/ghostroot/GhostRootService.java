@@ -173,7 +173,7 @@ public class GhostRootService extends Service {
                 .daemon(false)
                 .processNameSuffix("root")
                 .debuggable(false)
-                .version(32);
+                .version(33);
     }
 
     @Override

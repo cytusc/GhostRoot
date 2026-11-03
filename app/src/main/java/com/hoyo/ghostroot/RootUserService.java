@@ -586,8 +586,25 @@ public class RootUserService extends IRootRunner.Stub {
      * 并顺手完成 magica 补丁与 CSV 记录。 */
     private int verifyLanded(ILogCallback callback, String enforce, boolean ksu,
                              int round, float attackUptime, int exit) throws InterruptedException {
-        for (int i = 0; i < 18 && !readText("/proc/modules").contains("kernelsu"); i++) {
+        /* v47: 先刷一份 interim verdict —— 本机 KSU 移植模块表不可见，下面的
+         * 等待循环可能空转 90s，且后续 magica/pstore/zn 步骤耗时更长；期间
+         * 进程若被 LMK 杀掉（v46 实测：ROUND 2 END 后进程消失，verdict 全丢），
+         * 旧逻辑只在 finally 写一次 verdict，结果完全丢失。此刻先以
+         * su -c id 探测为准落一份 interim，finally 用最终结果覆盖。 */
+        String preSu = suCheck();
+        lastSu = preSu.trim();
+        lastRound = round;
+        boolean preVerified = lastSu.contains("uid=0");
+        lastVerdict = preVerified ? 0 : 1;
+        lastReason = preVerified ? "landed-su-verified-interim" : "landed-pending-verify";
+        writeVerdictFile(exit);
+        log(callback, "interim verdict flushed: " + lastReason);
+        for (int i = 0; i < 18 && !readText("/proc/modules").contains("kernelsu")
+                && !lastSu.contains("uid=0"); i++) {
             Thread.sleep(5000);
+            /* v47: su 早退判据（与 fire.sh v7 ksu_wait 同款）—— 模块表盲区
+             * 下不再固定空等 90s 才进入正式验证 */
+            lastSu = suCheck().trim();
         }
         ksu = readText("/proc/modules").contains("kernelsu");
         writeState("verifying", round);
