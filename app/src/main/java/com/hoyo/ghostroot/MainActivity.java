@@ -31,6 +31,10 @@ public class MainActivity extends Activity {
     private static final int REQ_PERMISSION = 1001;
     private static final String CLI_PATH = "/data/local/tmp/ghostlock";
     private static final String PROFILE_PATH = "/data/local/tmp/profile.bin";
+    /** v46: adb 自动化入口 —— `am start -a com.hoyo.ghostroot.action.ADB_RUN`。
+     * 仅接受 shell(2000)/root(0)/本应用 uid 的调用方（保持 P0 审查的防护语义：
+     * 普通第三方应用带着该 action 启动会被忽略）。 */
+    private static final String ACTION_ADB_RUN = "com.hoyo.ghostroot.action.ADB_RUN";
 
     private TextView logView;
     private Button runButton;
@@ -70,6 +74,36 @@ public class MainActivity extends Activity {
         append("目标: " + CLI_PATH + " + " + PROFILE_PATH);
         append("模式: 纯手动 —— 打开本应用只检查 Shizuku 状态，点击按钮才开始执行");
         refreshStatus(true);
+        maybeHandleAdbRun(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        maybeHandleAdbRun(intent);
+    }
+
+    /** v46: ADB 自动化触发 —— 验证调用方 uid 后延迟执行 onRunClicked。
+     * 延迟是为了让 Shizuku binder listener 先完成一次状态刷新。 */
+    private void maybeHandleAdbRun(Intent intent) {
+        if (intent == null || !ACTION_ADB_RUN.equals(intent.getAction())) {
+            return;
+        }
+        int uid = android.os.Binder.getCallingUid();
+        if (uid != android.os.Process.SHELL_UID
+                && uid != android.os.Process.ROOT_UID
+                && uid != android.os.Process.myUid()) {
+            append("收到 ADB_RUN 但调用方 uid=" + uid + " 不在白名单，忽略");
+            return;
+        }
+        append("ADB 触发执行（caller uid=" + uid + "），1.5s 后开始…");
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        runButton.postDelayed(() -> {
+            if (!isFinishing()) {
+                onRunClicked();
+            }
+        }, 1500L);
     }
 
     private static final String SHIZUKU_PACKAGE = "moe.shizuku.privileged.api";
