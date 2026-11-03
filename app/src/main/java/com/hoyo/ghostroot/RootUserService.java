@@ -148,6 +148,13 @@ public class RootUserService extends IRootRunner.Stub {
     /** v42 (13:2x 复位事故修复): fire 链收尾状态 —— killed=exploit 进程已不在
      * / still-running=落地后 ghostlock 还在跑（管理器门禁据此拒绝放行）。 */
     private String lastFirek = "not-run";
+    /** v48 (2026-11-03 netfix 故障分析): 落地后网络金丝雀。背景：vivo_net_fix 的
+     * 190 条 sepolicy 规则走 sepolicy.rule 文件，由 ksud 在开机 post-fs-data
+     * 注入 —— uapiGuard 即使当场把 uapi2 换成 uapi5，本 boot 的规则也补不上
+     * （13:51 boot 实测：Enforcing + 规则未注入 → 网络死，canary 全 FAIL）。
+     * 本字段只做记录与归因（net=ok / dead-enforcing-reboot-pending / ...），
+     * 是否 reboot 由 autoloop/用户决策 —— sepolicy 注入发生在下次 boot。 */
+    private String lastNet = "not-checked";
     /** v27: this session's own log file (never overwritten by the next run). */
     private String currentSessionFile;
     /** v33: 当前会话 ID（服务端下发）。verdict 文件会带上 session= 字段，
@@ -217,6 +224,7 @@ public class RootUserService extends IRootRunner.Stub {
         lastKernelRelease = "unknown";
         lastEnv = "unknown";
         lastUapi = "not-checked";
+        lastNet = "not-checked";
         try {
             /* v19: from now on every narrative line lands on disk too, so a
              * natural reset can no longer erase the session's story. */
@@ -363,6 +371,9 @@ public class RootUserService extends IRootRunner.Stub {
                     /* v38 (RootFamiliar ManagerProbe.uapi 借鉴): ksud uapi 守卫 */
                     lastUapi = uapiGuard(callback);
                     log(callback, "uapi=" + lastUapi);
+                    /* v48: 网络金丝雀（already-rooted 路径同样归因） */
+                    lastNet = netCanary(callback);
+                    log(callback, "net=" + lastNet);
                     /* v41: ZygiskNext 自愈（HMA-OSS/LSPosed 激活）—— 放最后，
                      * 万一触发软重启也不影响前面的取证与守卫步骤 */
                     lastZn = zygiskAutoActivate(callback);
@@ -566,6 +577,8 @@ public class RootUserService extends IRootRunner.Stub {
         sb.append("uapi=").append(lastUapi).append('\n');
         /* v41: ZygiskNext 激活结果（zn-ok-zygoteN / zn-softreboot-scheduled / ...） */
         sb.append("zn=").append(lastZn).append('\n');
+        /* v48: 落地后网络金丝雀（ok / dead-enforcing-reboot-pending / dead-permissive） */
+        sb.append("net=").append(lastNet).append('\n');
         /* v42: fire 链收尾状态 —— killed / still-running（管理器门禁依据） */
         sb.append("firek=").append(lastFirek).append('\n');
         sb.append("reason=").append(lastReason).append('\n');
@@ -628,6 +641,10 @@ public class RootUserService extends IRootRunner.Stub {
             /* v38 (RootFamiliar ManagerProbe.uapi 借鉴): ksud uapi 守卫 */
             lastUapi = uapiGuard(callback);
             log(callback, "uapi=" + lastUapi);
+            /* v48: 网络金丝雀（uapiGuard 之后 —— uapi 换装不影响本 boot 规则，
+             * 金丝雀 DEAD+Enforcing 即归因到 sepolicy.rule 待下次 boot 注入） */
+            lastNet = netCanary(callback);
+            log(callback, "net=" + lastNet);
             /* v41: ZygiskNext 自愈（HMA-OSS/LSPosed 激活）—— 放最后，
              * 万一触发软重启也不影响前面的取证与守卫步骤 */
             lastZn = zygiskAutoActivate(callback);
@@ -1025,6 +1042,38 @@ public class RootUserService extends IRootRunner.Stub {
         java.util.regex.Matcher m = java.util.regex.Pattern
                 .compile("\\(uapi:\\s*(\\d+)\\)").matcher(out);
         return m.find() ? Integer.parseInt(m.group(1)) : -1;
+    }
+
+    /** v48 (2026-11-03 netfix 故障分析): 落地后网络金丝雀 + 归因。
+     * 判据：ping 223.5.5.5（shell 域即可，不走 root——顺带验证非特权域数据面）。
+     * 归因逻辑：
+     *   ok                      —— 网络（含 shell 域）正常，vivo_net_fix 规则已生效
+     *   dead-enforcing-reboot-pending —— Enforcing + 网络死：典型 uapi 失配致
+     *                              sepolicy.rule 未注入（或 v1.7 域级规则在
+     *                              Enforcing 下救不了 unlabeled 数据面）。
+     *                              uapiGuard 若刚换装成功，规则下次 boot 注入
+     *                              —— reboot 是恢复路径，记录给 autoloop/用户决策
+     *   dead-permissive         —— Permissive 下仍死：非 SELinux 问题（路由/
+     *                              供应商侧），转 pstore/dmesg 取证
+     * 只记录不动作：不自动 setenforce（与隐藏目标冲突）、不自动 reboot。 */
+    private String netCanary(ILogCallback callback) {
+        try {
+            ShellResult p = rootShell("ping -c1 -W2 223.5.5.5 >/dev/null 2>&1 && echo OK || echo DEAD", 10);
+            boolean ok = p.ok() && p.out != null && p.out.contains("OK");
+            if (ok) {
+                return "ok";
+            }
+            String enforce = readText("/sys/fs/selinux/enforce").trim();
+            if ("1".equals(enforce)) {
+                log(callback, "net canary: DEAD + Enforcing —— vivo_net_fix 规则未生效"
+                        + "（sepolicy.rule 由 ksud 开机注入；若 uapiGuard 刚换装，reboot 后恢复）");
+                return "dead-enforcing-reboot-pending";
+            }
+            log(callback, "net canary: DEAD + Permissive —— 非 SELinux 问题，需另行取证");
+            return "dead-permissive";
+        } catch (Throwable e) {
+            return "canary-error:" + e.getClass().getSimpleName();
+        }
     }
 
     /** v41: ZygiskNext 自动激活（late-load 自愈）。
