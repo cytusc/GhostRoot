@@ -30,6 +30,7 @@ PKG="com.hoyo.ghostroot"
 SHIZUKU_PKG="moe.shizuku.privileged.api"
 ADB_RUN_ACTION="com.hoyo.ghostroot.action.ADB_RUN"
 EXPECTED_KERNEL="${EXPECTED_KERNEL:-5.15.197-g346b1c36bd5c-dirty}"  # 你手机实际内核
+EXPECTED_UAPI="${EXPECTED_UAPI:-5}"   # 本机内核(g346b1c36bd5c)的 KSU UAPI=5；/data/adb/ksud 若是 uapi2 会导致模块安装/sepolicy 注入全部失败
 
 SHIZUKU_WAIT="${SHIZUKU_WAIT:-10}"      # 启动 Shizuku 后等待秒数
 VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-90}"  # 触发后判定提权的轮询总时长(秒)
@@ -201,6 +202,52 @@ force_reboot() {
     wait_online || die "重启后设备未恢复"
 }
 
+# ---------- 落地后守卫：ksud UAPI ----------
+# 2026-11-03 教训：落地后 /data/adb/ksud 可能是 uapi2（链内 swap 只在 autoroot-v2 里做，
+# autoloop 之前不做）——后果：ksud module install 报 UAPI mismatch、vivo_net_fix 的
+# sepolicy 规则静默不注入（Enforcing 下网络必断）、bszip 安装器内刷三件套全挂。
+# 参考 PathMask 离线分析：struct module 1024(GKI) vs 960(vivo)，任何 LKM 路线已判死，
+# 模块体系全靠 ksud 正常工作，此守卫是落地后的必要一步。
+ksud_uapi() {
+    a shell 'su -c "/data/adb/ksud -V 2>/dev/null"' 2>/dev/null | tr -d '\r' \
+        | grep -oE 'uapi: [0-9]+' | grep -oE '[0-9]+' | head -1
+}
+
+uapi_guard() {
+    local u
+    u=$(ksud_uapi)
+    if [ "$u" = "$EXPECTED_UAPI" ]; then
+        log "uapi guard: /data/adb/ksud uapi$u ok"
+        return 0
+    fi
+    warn "uapi guard: ksud uapi${u:-?} != 期望 uapi$EXPECTED_UAPI，尝试换用 /data/local/tmp/ksud-gk"
+    # 备源检查：ksud-gk 不在设备上则无能为力（只告警，不失败——root 本身已到手）
+    if ! a shell 'ls /data/local/tmp/ksud-gk >/dev/null 2>&1'; then
+        warn "uapi guard: /data/local/tmp/ksud-gk 不存在，跳过替换（请手动处理）"
+        return 1
+    fi
+    a shell 'su -c "cp -f /data/adb/ksud /data/adb/ksud-uapi2.bak 2>/dev/null; cp -f /data/local/tmp/ksud-gk /data/adb/ksud; chown 0:0 /data/adb/ksud; chmod 755 /data/adb/ksud"' >/dev/null 2>&1
+    u=$(ksud_uapi)
+    if [ "$u" = "$EXPECTED_UAPI" ]; then
+        log "uapi guard: 已替换为 uapi$u"
+        return 0
+    fi
+    warn "uapi guard: 替换后仍为 uapi${u:-?}（可能与 autoroot-v2 的 b0 通道一样需要绕 vivo LSM），请手动处理"
+    return 1
+}
+
+# ---------- 落地后状态快照（死因/状态归因用，全部尽力而为不阻塞） ----------
+post_root_snapshot() {
+    log "---- 落地后状态快照 ----"
+    log "ksud: $(a shell 'su -c "/data/adb/ksud -V 2>/dev/null"' 2>/dev/null | tr -d '\r' | head -1)"
+    log "selinux: $(a shell 'getenforce 2>/dev/null' 2>/dev/null | tr -d '\r')"
+    log "net(canary): $(a shell 'ping -c1 -W2 223.5.5.5 >/dev/null 2>&1 && echo OK || echo DEAD' 2>/dev/null | tr -d '\r')"
+    log "modules: $(a shell 'su -c "ls -1 /data/adb/modules/ 2>/dev/null" | tr -d "\r" | tr "\n" " "' 2>/dev/null)"
+    log "disabled: $(a shell 'su -c "ls /data/adb/modules/*/disable 2>/dev/null" | tr -d "\r" | tr "\n" " "' 2>/dev/null)"
+    log "modules_update: $(a shell 'su -c "ls -1 /data/adb/modules_update/ 2>/dev/null" | tr -d "\r" | tr "\n" " "' 2>/dev/null)"
+    log "------------------------"
+}
+
 # ---------- 主循环 ----------
 log "===== GhostRoot 自动提权循环开始 (MAX_ROUNDS=$MAX_ROUNDS, VERIFY_TIMEOUT=${VERIFY_TIMEOUT}s) ====="
 log "adb=$ADB  expect_kernel=$EXPECTED_KERNEL"
@@ -261,6 +308,8 @@ while true; do
 
     if verify_root "$BOOT"; then
         log "🎉🎉🎉 第 $ROUND 轮成功提权！停止循环。"
+        uapi_guard || true
+        post_root_snapshot
         {
             echo "==== ROOT OBTAINED at $(date) ===="
             echo "boot_id: $BOOT"
