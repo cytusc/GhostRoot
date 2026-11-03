@@ -34,9 +34,11 @@ OTA 即本机内核的权威参照物。
 - `kernel.Image`（48MB，arm64 原始内核，来自 OTA boot 分区）
 - `kernel.elf`（vmlinux-to-elf 重建，191,910 符号，kallsyms 查询/符号存在性分析用）
 - `stock-crc-db.json`（621 ko 的 __versions CRC 库，按目录分 top/gki）
-- `stock-btf.json`（stock ko BTF 结构体布局；vivo 内核 Image 无 BTF）
 - `vendor_dlkm-ko-20261103.tar.gz`（48.8MB，621 个官方 stock ko 原文件；解压：`tar xzf vendor_dlkm-ko-20261103.tar.gz`）
 - `system_dlkm.img`（340KB，erofs，system 侧 GKI 模块镜像——另一套 ABI 的对照物）
+- 注：stock ko 的 .BTF 为 split-BTF（依赖内核 base BTF 去重，vivo 内核不发布 BTF），
+  424 个中仅 89 个可解析且无带成员结构体，**结构体布局分析不可走此路**；
+  struct module 大小以 `.gnu.linkonce.this_module` 段大小为准（可靠）
 - 产物均提取自 OTA `20260821165517a9daef51ef9cbd772f4c3e9f4872e12b.zip`（9.1GB，未入库）
 
 ## 三、对 PathMask 路线的最终判定
