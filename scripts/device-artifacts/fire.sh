@@ -1,5 +1,15 @@
 #!/system/bin/sh
-# fire.sh v6 - watch permissive/uid=0 (long window ~55min); fire ksud chain; kill supervisor
+# fire.sh v7 - watch permissive/uid=0 (long window ~55min); fire ksud chain; kill supervisor
+#
+# v7 (2026-11-03, 06:59 硬重启事故修复 —— 同 boot 二次开火打崩内核):
+#   LANDED 后 .fired 记 boot_id（旧版只写 "FIRED"，无 boot 作用域，形同虚设）。
+#   watcher 启动时若 .fired 与当前 boot_id 一致 → 本 boot 已有一发成功落地，
+#   堆已被污染、KSU 已在内核里 —— 立即退出，绝不二次开火。
+#   （06:59 事故链：06:57:41 第一发 LANDED+KSU 上线 → 06:58:37 第二发未被
+#   alive-dedup 拦截（第一发已退出）→ polluted heap 二次写 → RCU stall →
+#   panic_on_rcu_stall=1 → PS_HOLD 硬复位。）
+#   ksu_wait 循环加 `su -c id` 早退判据 —— 该 KSU 移植为运行时 hook，
+#   /proc/modules 里不出现，旧判据必等满 20s。
 #
 # v6 (2026-11-02, 13:2x 连续复位事故修复):
 #   1) b0 调用加 10s 硬超时 —— 13:23 事故中 b0 卡死在 vendor socket，
@@ -16,17 +26,24 @@ exec >>$LOG 2>&1
 
 PIDFILE=/data/local/tmp/.fire.pid
 BOOTID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+# v7: 同 boot 已 LANDED 门禁 —— 比 alive-dedup 更强的闸（watcher 已退出时
+# alive-dedup 失效，06:58:37 二次开火正是这种时序）
+OLDFIRED=$(cat /data/local/tmp/.fired 2>/dev/null)
+if [ -n "$BOOTID" ] && [ "$OLDFIRED" = "$BOOTID" ]; then
+  echo "=== fire v7 $(date +%T) pid=$$ fired_already: .fired matches this boot — LANDED earlier, refusing re-fire ==="
+  exit 0
+fi
 OLD=$(cat $PIDFILE 2>/dev/null)
 OLDPID=${OLD%% *}
 OLDBOOT=${OLD#* }
 if [ -n "$OLDPID" ] && [ "$OLDBOOT" = "$BOOTID" ] \
    && [ -d "/proc/$OLDPID" ] \
    && grep -q "fire.sh" "/proc/$OLDPID/cmdline" 2>/dev/null; then
-  echo "=== fire v6 $(date +%T) pid=$$ dedup: watcher pid=$OLDPID alive (same boot) — exit ==="
+  echo "=== fire v7 $(date +%T) pid=$$ dedup: watcher pid=$OLDPID alive (same boot) — exit ==="
   exit 0
 fi
 echo "$$ $BOOTID" > $PIDFILE
-echo "=== fire v6 $(date +%T) pid=$$ ==="
+echo "=== fire v7 $(date +%T) pid=$$ ==="
 i=0
 while [ $i -lt 33000 ]; do
   e=$(cat /sys/fs/selinux/enforce 2>/dev/null)
@@ -38,14 +55,18 @@ while [ $i -lt 33000 ]; do
     # v6: 硬超时 —— b0 无响应也必须走到 exploit_killed
     timeout 10 ./b0 atcid_vendor_socket "sh /data/local/tmp/one.sh #seedkeeper_client"
     echo "chain_fired rc=$? $(date +%T)"
-    echo FIRED > /data/local/tmp/.fired
+    # v7: .fired 记 boot_id —— 同 boot 拒绝任何后续开火（App 侧同判据）
+    echo "$BOOTID" > /data/local/tmp/.fired
     for p in $(pgrep -f "id; getenforce; sleep 300" 2>/dev/null); do kill -9 $p 2>/dev/null; done
     echo "supervisors_killed $(date +%T)"
     # v6: wait for the KSU module, then kill the exploit -- its remaining
     # stages (W2/W3 repairs) can wedge the kernel even after root is in.
+    # v7: 该 KSU 移植是运行时 hook，/proc/modules 不可见 —— 加 su -c id
+    # 早退判据，root 活了就立刻进入收尾，不再空等 20s。
     n=0
     while [ $n -lt 40 ]; do
       if grep -q kernelsu /proc/modules 2>/dev/null; then break; fi
+      if [ $((n % 4)) -eq 3 ] && su -c id 2>/dev/null | grep -q "uid=0"; then break; fi
       sleep 0.5; n=$((n+1))
     done
     # v6: 无论 KSU 是否出现都杀 exploit —— 落地后 W2/W3 是已知 wedge 源
@@ -57,4 +78,4 @@ while [ $i -lt 33000 ]; do
   i=$((i+1))
   sleep 0.1
 done
-echo "watch_timeout v6 $(date +%T)"
+echo "watch_timeout v7 $(date +%T)"

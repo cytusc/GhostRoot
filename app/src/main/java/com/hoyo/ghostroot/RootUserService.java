@@ -27,10 +27,18 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class RootUserService extends IRootRunner.Stub {
 
     private static final long CLI_TIMEOUT_SECONDS = 240;
-    /** rounds per Shizuku session (one boot) — mirrors PC autoroot's cycle loop. */
+    /** rounds per Shizuku session (one boot) — mirrors PC autoroot's cycle loop.
+     * v45: 每轮都是独立 lottery 前提是"堆还干净"——fire 链一旦 LANDED（.fired
+     * 匹配本 boot），循环立即终止，绝不二次开火（06:59 事故根因）。 */
     private static final int MAX_ROUNDS = 10;
     /** PC rhythm: ~20s cooldown between cycles. */
     private static final long ROUND_COOLDOWN_SECONDS = 20;
+    /** v45: fire.sh v7 的落地标记 —— LANDED 后写本 boot 的 boot_id。
+     * 同 boot 值匹配 = 该内核已被成功攻击过，再攻即 known wedge scenario。 */
+    private static final String FIRED_PATH = "/data/local/tmp/.fired";
+    /** v45: 跨工具门禁 —— timer 系 exploit 驱动器的 pidfile（同一台设备
+     * 混用两套 root 工具会互相污染堆状态）。 */
+    private static final String TIMER_PID_PATH = "/data/local/tmp/98260.pid";
     /** Log analysis (21 attacks, 2026-10-30): 0/11 writes landed when the
      * attack started <100s after boot; 3/3 landed at >=102s. Boot-time service
      * churn keeps the heap unstable during the first minute — wait it out. */
@@ -306,15 +314,27 @@ public class RootUserService extends IRootRunner.Stub {
              * known wedge scenario — never do it. */
             String preSu = suCheck();
             boolean preKsu = readText("/proc/modules").contains("kernelsu");
-            if (preSu.contains("uid=0") || preKsu) {
+            /* v45: fire.sh v7 落地标记 + 跨工具 exploit 门禁 —— 三者任一命中
+             * 都说明本 boot 的堆已被攻击过/根已活，继续开火即 polluted-heap
+             * wedge 场景（06:59:52 PS_HOLD 硬复位事故的直接根因）。 */
+            boolean preFired = firedThisBoot();
+            boolean preForeign = foreignExploitRunning();
+            if (preSu.contains("uid=0") || preKsu || preFired || preForeign) {
                 boolean verified = preSu.contains("uid=0");
                 log(callback, verified
                         ? "ROOT ALREADY LIVE on this boot (su -c id: " + preSu.trim() + ") — skipping attack entirely (PC root_ok gate)"
-                        : "KernelSU module already loaded but root unverified (" + preSu.trim() + ") — skipping attack (polluted-heap guard)");
+                        : preKsu
+                        ? "KernelSU module already loaded but root unverified (" + preSu.trim() + ") — skipping attack (polluted-heap guard)"
+                        : preFired
+                        ? "fire chain already LANDED this boot (.fired boot_id match) but root unverified (" + preSu.trim() + ") — skipping attack (polluted-heap guard)"
+                        : "another exploit driver (98260) is live on this boot — skipping attack (cross-tool heap guard)");
                 lastVerdict = verified ? 0 : 1;
                 lastRound = 0;
                 lastSu = preSu.trim();
-                lastReason = verified ? "root-already-live-skip-attack" : "ksu-already-loaded-skip-attack";
+                lastReason = verified ? "root-already-live-skip-attack"
+                        : preKsu ? "ksu-already-loaded-skip-attack"
+                        : preFired ? "fired-already-this-boot-skip-attack"
+                        : "foreign-exploit-live-skip-attack";
                 if (verified) {
                     exit = 0;
                     lastMagica = runMagicaFix(callback);
@@ -353,10 +373,10 @@ public class RootUserService extends IRootRunner.Stub {
                 }
                 writeState("already-rooted", 0);
                 csvRow("already-rooted", readUptime(), 0, String.valueOf(exit),
-                        readText("/sys/fs/selinux/enforce").trim(), preKsu, verified ? "root-live" : "ksu-only");
+                        readText("/sys/fs/selinux/enforce").trim(), preKsu, verified ? "root-live" : "landed-unverified");
                 return;
             }
-            log(callback, "no KSU on this boot yet — clean heap, attack allowed");
+            log(callback, "no KSU / no fired mark / no foreign driver on this boot — clean heap, attack allowed");
 
             /* v18: deploy the magica-fix artifacts (fixed libksud + fix.sh) from
              * APK assets. uid 2000 can write /data/local/tmp, no root needed. */
@@ -409,8 +429,23 @@ public class RootUserService extends IRootRunner.Stub {
                 if (round > 1) {
                     log(callback, "cooldown " + ROUND_COOLDOWN_SECONDS + "s (PC autoroot rhythm)");
                     Thread.sleep(ROUND_COOLDOWN_SECONDS * 1000L);
+                    /* v45: 冷却判据升级 —— /proc/modules 对运行时 hook 移植
+                     * 是盲的（06:59 事故：KSU 已活但模块表无 kernelsu，
+                     * round 3 照打）。三层判据任一命中即终止：
+                     *   1. /proc/modules 含 kernelsu（传统信号）
+                     *   2. su -c id 含 uid=0（root 已活，最终裁决）
+                     *   3. .fired == 本 boot_id（fire 链已看见落地并开过链） */
                     if (readText("/proc/modules").contains("kernelsu")) {
                         log(callback, "KernelSU appeared during cooldown (fire chain)");
+                        break;
+                    }
+                    if (firedThisBoot()) {
+                        log(callback, "fire chain LANDED during cooldown (.fired boot_id match) — single-shot guard, no re-attack");
+                        break;
+                    }
+                    String cdSu = suCheck();
+                    if (cdSu.contains("uid=0")) {
+                        log(callback, "root went live during cooldown (su -c id: " + cdSu.trim() + ") — single-shot guard, no re-attack");
                         break;
                     }
                 }
@@ -441,7 +476,15 @@ public class RootUserService extends IRootRunner.Stub {
                 log(callback, "ROUND " + round + " END rc=" + exit
                         + " enforce=" + (enforce.isEmpty() ? "UNREADABLE" : enforce)
                         + " ksu=" + (ksu ? "1" : "0"));
-                if (ksu || "0".equals(enforce)) {
+                /* v45: .fired 匹配本 boot = fire 链在本轮攻击期间看见过落地
+                 * （permissive 或 uid=0）并已开链 —— 这是对运行时 hook 移植
+                 * 唯一可靠的落地信号（enforce 可能被链内 fixup 恢复、模块表
+                 * 不可见）。命中即按 landed 处理，绝不进入下一轮。 */
+                boolean firedNow = firedThisBoot();
+                if (ksu || "0".equals(enforce) || firedNow) {
+                    if (firedNow && !ksu && !"0".equals(enforce)) {
+                        log(callback, "landing detected via .fired boot_id match only (enforce restored / module invisible) — treating as LANDED");
+                    }
                     /* The exploit LANDED (permissive or KSU up). Per v26 the
                      * judge is now the SAME as PC autoroot: `su -c id` must
                      * contain uid=0. Landing without a passing su check is
@@ -455,10 +498,12 @@ public class RootUserService extends IRootRunner.Stub {
                 writeState("cooldown", round);
             }
             /* v26: cooldown 期检测到 KSU 的 break 也会落到这里 —— 先按同一
-             * 判据验证 su，再决定是"landed"还是"耗尽"。 */
+             * 判据验证 su，再决定是"landed"还是"耗尽"。 v45: 补 .fired 判据
+             * （cooldown 单发守卫 break 的主路径就是它）。 */
             String enforceAfter = readText("/sys/fs/selinux/enforce").trim();
             boolean ksuAfter = readText("/proc/modules").contains("kernelsu");
-            if (ksuAfter || "0".equals(enforceAfter)) {
+            boolean firedAfter = firedThisBoot();
+            if (ksuAfter || "0".equals(enforceAfter) || firedAfter) {
                 if (verifyLanded(callback, enforceAfter, ksuAfter, MAX_ROUNDS, readUptime(), exit) == 0) {
                     exit = 0;
                 }
@@ -1404,6 +1449,34 @@ public class RootUserService extends IRootRunner.Stub {
         }
         String cmdline = readText("/proc/" + parts[0] + "/cmdline");
         return cmdline != null && cmdline.contains("fire.sh");
+    }
+
+    /** v45: fire.sh v7 落地标记 —— .fired 内容等于本 boot 的 boot_id 时，
+     * 本 boot 已有一发成功落地（fire 链 LANDED 后写入）。跨 boot 的旧值
+     * （旧格式 "FIRED" 或上一个 boot 的 id）不匹配，自然失效。 */
+    private boolean firedThisBoot() {
+        String fired = readText(FIRED_PATH);
+        String bootId = readText("/proc/sys/kernel/random/boot_id");
+        return fired != null && bootId != null
+                && !fired.trim().isEmpty()
+                && fired.trim().equals(bootId.trim());
+    }
+
+    /** v45: 跨工具门禁 —— timer 系 exploit 驱动器（98260.pid）是否在本 boot
+     * 存活。pidfile 跨 boot 残留会有 PID 复用误报，因此要求 /proc/<pid>/cmdline
+     * 含 "profile.conf"（该驱动的 exploit 以 --profile 参数运行）才判定存活。
+     * 方向偏安全：误报只会跳过攻击（要求重启），不会误攻。 */
+    private boolean foreignExploitRunning() {
+        String pidLine = readText(TIMER_PID_PATH);
+        if (pidLine == null || pidLine.trim().isEmpty()) {
+            return false;
+        }
+        String pid = pidLine.trim().split("\\s+")[0];
+        if (!pid.matches("\\d+")) {
+            return false;
+        }
+        String cmdline = readText("/proc/" + pid + "/cmdline");
+        return cmdline != null && cmdline.contains("profile.conf");
     }
 
     /** v42: ghostlock exploit 进程是否仍在运行 —— /proc 扫描（不用 pgrep -f，

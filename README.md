@@ -6,10 +6,29 @@
 ## 版本
 
 ```
-versionCode  42
-versionName  2.26
-UserService  31       ← 改 RootUserService 逻辑必须同步 +1
+versionCode  45
+versionName  2.29
+UserService  32       ← 改 RootUserService 逻辑必须同步 +1
 ```
+
+### v45（2026-11-03，06:59 硬重启事故修复 —— 同 boot 二次开火）
+
+事故链：06:57:41 第一发 LANDED+KSU 上线 → 06:58:37 第二发未被 alive-dedup
+拦截（第一发 watcher 已退出）→ polluted heap 二次写 → RCU stall →
+`panic_on_rcu_stall=1`（cmdline）→ 06:59:52 PS_HOLD 硬复位。
+根因：该 KSU 移植为运行时 hook，`/proc/modules` 不可见，全链的 KSU 判据全盲。
+
+| 修复项 | 位置 |
+|---|---|
+| fire.sh v7：`.fired` 记 boot_id（旧版只写 "FIRED"，无 boot 作用域）；watcher 启动时同 boot 匹配即拒绝开火 | `scripts/device-artifacts/fire.sh`（需推设备） |
+| fire.sh v7：ksu_wait 加 `su -c id` 早退判据（模块表盲区下不再空等 20s） | 同上 |
+| run 入口门禁扩展：preSu / ksu 模块 / `.fired` boot_id / 98260 跨工具驱动 四判据任一命中即跳过攻击 | `RootUserService`（already-rooted 路径分流） |
+| 循环冷却判据升级：kernelsu 模块 ∨ `su -c id` uid=0 ∨ `.fired` boot_id，任一命中终止循环（单发守卫） | `RootUserService` round 循环 |
+| 落地检测补盲区：`.fired` 匹配也按 LANDED 处理（enforce 可能被 fixup 恢复、模块不可见） | `RootUserService` round END 判定 + 耗尽后判定 |
+| 跨工具门禁：98260.pid（timer 系驱动器）存活（cmdline 含 profile.conf）则拒绝攻击 | `RootUserService.foreignExploitRunning()` |
+
+> 参考：timer-release.apk（单发 + parked 门禁模型）与干净轮次日志
+> （成功形态 = `ksud daemon poll: module/install visible`）。
 
 ### v42（2026-11-02，13:2x 连续复位事故修复）
 
