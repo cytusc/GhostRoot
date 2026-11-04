@@ -8,6 +8,10 @@ local.properties
 .idea/
 *.iml
 .DS_Store
+.workbuddy/
 
 # 构建产物（可由源码复现）
 *.apk
+
+# 大体积二进制备份（模块/安装包，不入库）
+backups/modules-20261103/
