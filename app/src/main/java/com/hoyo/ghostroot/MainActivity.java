@@ -556,21 +556,24 @@ public class MainActivity extends Activity {
             append("已有任务在执行中，已为你重新接上日志");
             return;
         }
+        /* v53: Shizuku 三重门槛（安装/运行/授权）任一不满足时，自动回退
+         * root 直连修复 —— 提权成功后 KernelSU 的 su 就在，App 自己 exec su
+         * 跑同一套修复链即可，不再依赖 Shizuku server（框架软重启会杀死）
+         * 和 Shizuku 授权（每 boot 可能要点允许）。 */
         if (!shizukuInstalled()) {
-            append("Shizuku 未安装，无法修复");
+            append("Shizuku 未安装 → 转 root 直连修复");
+            startRootRepair();
             return;
         }
         if (!Shizuku.pingBinder()) {
-            append("Shizuku 未运行：先打开 Shizuku 用无线调试启动，再回来点");
+            append("Shizuku 未运行 → 转 root 直连修复");
+            startRootRepair();
             return;
         }
         if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-            append("请求 Shizuku 授权…");
-            try {
-                Shizuku.requestPermission(REQ_PERMISSION);
-            } catch (Throwable t) {
-                append("请求授权失败: " + t);
-            }
+            /* 首次/未授权时不弹 Shizuku 授权（要用户去点），root 直连一步到位 */
+            append("Shizuku 未授权 → 转 root 直连修复（免授权）");
+            startRootRepair();
             return;
         }
         if (activitySink == null) {
@@ -583,6 +586,136 @@ public class MainActivity extends Activity {
         append("----- ZN 一键修复（手动触发）-----");
         Intent intent = new Intent(this, GhostRootService.class).setAction(GhostRootService.ACTION_ZN_REPAIR);
         startForegroundService(intent);
+    }
+
+    /** v53: root 直连修复 —— App 进程 exec `su`（KernelSU），与
+     * scripts/gr_autoloop.sh 的 repair_via_root() 和 usvc znRepair 同语义：
+     * 清闩锁/自禁用 → 确保 daemon → 清 dex2oat-flags → 写留痕 → 回写 verdict zn=。
+     * 首次调用会弹 KernelSU 授权（KSU 管理器「允许」一次即可，持久生效）。 */
+    private volatile boolean rootRepairing = false;
+
+    private void startRootRepair() {
+        if (rootRepairing) {
+            append("root 修复进行中，忽略重复点击");
+            return;
+        }
+        rootRepairing = true;
+        repairButton.setEnabled(false);
+        repairButton.setText("修复中…");
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        append("----- ZN 一键修复（root 直连，无需 Shizuku）-----");
+        new Thread(() -> {
+            boolean ok = false;
+            try {
+                ok = runRootRepairFlow();
+            } catch (Throwable t) {
+                append("root 修复异常: " + t);
+            }
+            final boolean done = ok;
+            runOnUiThread(() -> {
+                rootRepairing = false;
+                append(done ? "=== root 直连修复完成 ===" : "=== root 直连修复未成功（见上方日志）===");
+                refreshButtonStates();
+                getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            });
+        }, "gr-root-repair").start();
+    }
+
+    /** 执行 root 修复链。返回 true=修复成功（zn-ok）。所有 su 调用统一走 suRun。 */
+    private boolean runRootRepairFlow() {
+        /* 1) root 门禁：su 可用且 uid=0（首次调用会触发 KSU 授权弹窗） */
+        String id = suRun("id");
+        if (id == null || !id.contains("uid=0")) {
+            append("root 不可用（" + (id == null ? "su 执行失败" : id.trim()) + "）");
+            append("请确认已提权成功，并在 KernelSU 管理器里允许本 App 的 root 请求");
+            return false;
+        }
+        append("root 门禁通过: " + id.trim());
+
+        /* 2) 前置清闩锁 + 自禁用（ZN 秒退双根因之一） */
+        suRun("rm -f /data/adb/zygisksu/.abort_msg"
+                + " /data/adb/modules/zygisksu/disable"
+                + " /data/adb/modules/zygisksu/module.prop.orig");
+        append("已清闩锁/自禁用标记");
+
+        /* 3) 读状态；daemon 无响应按正确 CWD 拉起（cd 模块目录是隐式配置） */
+        String st = suRun("/data/adb/modules/zygisksu/bin/zygiskd status 2>/dev/null");
+        String zygotes = grepValue(st, "zygote_states:");
+        if (zygotes == null) {
+            append("zygiskd 无响应 → 拉起 daemon（CWD=模块目录）");
+            suRun("cd /data/adb/modules/zygisksu"
+                    + " && setsid ./bin/zygiskd daemon >/dev/null 2>&1 </dev/null &");
+            try { Thread.sleep(3000); } catch (InterruptedException ignored) { }
+            st = suRun("/data/adb/modules/zygisksu/bin/zygiskd status 2>/dev/null");
+            zygotes = grepValue(st, "zygote_states:");
+        }
+        int z = 0;
+        try { z = Integer.parseInt(zygotes == null ? "0" : zygotes.trim()); } catch (NumberFormatException ignored) { }
+        append("zygiskd status: zygote_states=" + z);
+
+        /* 4) 幂等清 dex2oat-flags（工行兼容，任何分支都清） */
+        suRun("/data/adb/ksu/bin/resetprop --delete dalvik.vm.dex2oat-flags 2>/dev/null");
+
+        /* 5) 结论 + 留痕 + verdict zn= 回写（UI「已修复」判定的依据） */
+        String outcome = z >= 1 ? ("zn-ok-zygote" + z) : "zn-softreboot-scheduled";
+        if (z < 1) {
+            append("zygote 未挂钩 → 调度框架软重启（stop;start，~40s）");
+            suRun("setsid sh -c 'sleep 2; stop; sleep 4; start' >/dev/null 2>&1 </dev/null &");
+        }
+        String now = suRun("date +%s");
+        String up = suRun("cat /proc/uptime");
+        String ts = firstToken(now), uptime = firstToken(up);
+        suRun("echo 'ts=" + ts + " uptime=" + uptime + "s outcome=" + outcome
+                + "' > /data/local/tmp/.gr_zn_repair");
+        suRun("sed -i 's/^zn=.*/zn=" + outcome + "/' /data/local/tmp/.gr_verdict"
+                + "; grep -q '^zn=' /data/local/tmp/.gr_verdict"
+                + " || echo 'zn=" + outcome + "' >> /data/local/tmp/.gr_verdict");
+        append("修复结论: " + outcome + "（留痕 + verdict zn= 已回写）");
+        return z >= 1;
+    }
+
+    /** exec su 执行命令：优先 PATH 里的 su，失败回退 KSU 的绝对路径。
+     * 返回合并输出（stdout+stderr），进程启动失败返回 null。 */
+    private String suRun(String cmd) {
+        String[] candidates = { "su", "/data/adb/ksu/bin/su" };
+        for (String su : candidates) {
+            try {
+                Process p = new ProcessBuilder(su, "-c", cmd).redirectErrorStream(true).start();
+                java.io.BufferedReader r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(p.getInputStream()));
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = r.readLine()) != null) {
+                    sb.append(line).append('\n');
+                    if (sb.length() > 64 * 1024) break;   /* 防状态输出过大 */
+                }
+                p.waitFor();
+                return sb.toString();
+            } catch (java.io.IOException e) {
+                /* 该路径不存在 → 换下一个候选 */
+            } catch (InterruptedException e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static String grepValue(String text, String key) {
+        if (text == null) return null;
+        for (String line : text.split("\n")) {
+            line = line.trim();
+            if (line.startsWith(key)) {
+                return line.substring(key.length()).trim();
+            }
+        }
+        return null;
+    }
+
+    private static String firstToken(String s) {
+        if (s == null) return "0";
+        s = s.trim();
+        int sp = s.indexOf(' ');
+        return sp > 0 ? s.substring(0, sp) : s;
     }
 
     private void onRebootClicked() {
