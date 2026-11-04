@@ -263,6 +263,19 @@ public class RootUserService extends IRootRunner.Stub {
                     }
                     log(callback, "提示: 若上面安排了 soft-reboot，框架将重启 ~40s，"
                             + "期间界面卡住属正常；结束后可再点一次「Zygisk 修复」复查终态");
+                    /* v49: 修复成功留痕 —— 手机端「已修复」按钮状态依据本
+                     * 文件 + 本 boot 时效（ts 距今 <= uptime）判定。framework
+                     * 软重启（stop/start）不清 uptime，状态跨软重启保留；
+                     * 整机重启后自然失效。仅 zn-ok / softreboot-scheduled
+                     * 两种成功形态留痕 —— zn-absent/ 竞态错误不写，避免
+                     * "已修复"误导（按钮保持可点，日志里有真实原因）。 */
+                    if (r.startsWith("zn-ok") || r.equals("zn-softreboot-scheduled")) {
+                        writeLine(TMP + "/.gr_zn_repair",
+                                "ts=" + System.currentTimeMillis() / 1000
+                                        + " uptime=" + readUptime() + "s outcome=" + r + "\n",
+                                false);
+                        log(callback, "修复留痕: " + TMP + "/.gr_zn_repair");
+                    }
                 }
             } catch (Throwable e) {
                 log(callback, "repair error: " + e);

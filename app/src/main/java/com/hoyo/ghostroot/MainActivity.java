@@ -230,6 +230,122 @@ public class MainActivity extends Activity {
         } else {
             showInterruptedBanner();
         }
+        /* v49: 按设备侧文件恢复按钮状态 —— App 被杀重开后，「已提权/
+         * 已修复」不丢（本 boot 时效判定），避免"忘记修没修过"重复点击 */
+        if (!GhostRootService.running) {
+            refreshButtonStates();
+        }
+    }
+
+    private static final String VERDICT_PATH = "/data/local/tmp/.gr_verdict";
+    private static final String ZN_REPAIR_MARK = "/data/local/tmp/.gr_zn_repair";
+
+    /** v49: 文件 ts 是否落在本 boot 内 —— 距今不超过 uptime 即本 boot 写入。
+     * 与 showInterruptedBanner 的中断判定同一时钟逻辑（整机重启后 uptime
+     * 归零，旧 ts 的 age 必然大于 uptime → 状态自动复位；framework 软重启
+     * 不清 uptime → 状态跨软重启保留）。 */
+    private boolean freshThisBoot(long ts) {
+        if (ts <= 0) {
+            return false;
+        }
+        long age = System.currentTimeMillis() / 1000 - ts;
+        return age >= 0 && age <= readUptimeSeconds();
+    }
+
+    /** v49: 依据设备侧证据刷新两按钮的持久状态。
+     * 提权：.gr_verdict verdict=0 且本 boot 内 → 「✅ 已提权」并禁点
+     *   （exploit 每 boot 只允许一次，重复点击只会被门禁吞掉）。
+     * 修复：.gr_zn_repair（znRepair 成功留痕）本 boot 内 → 「✅ 已修复」；
+     *   outcome 含 softreboot 时保持可点（软重启后需复查确认）；
+     *   会话自动激活成功（verdict zn=zn-ok*）同样视为已修复。
+     * 任务运行中不碰按钮（运行态由点击/重连分支管理）。 */
+    private void refreshButtonStates() {
+        boolean rootLanded = false;
+        String zn = "";
+        String vf = readTmpFile(VERDICT_PATH);
+        if (vf != null) {
+            long ts = 0;
+            int verdict = Integer.MIN_VALUE;
+            for (String line : vf.split("\n")) {
+                int eq = line.indexOf('=');
+                if (eq < 0) {
+                    continue;
+                }
+                String k = line.substring(0, eq).trim();
+                String v = line.substring(eq + 1).trim();
+                if ("ts".equals(k)) {
+                    try {
+                        ts = Long.parseLong(v);
+                    } catch (NumberFormatException ignored) {
+                    }
+                } else if ("verdict".equals(k)) {
+                    try {
+                        verdict = Integer.parseInt(v);
+                    } catch (NumberFormatException ignored) {
+                    }
+                } else if ("zn".equals(k)) {
+                    zn = v;
+                }
+            }
+            rootLanded = verdict == 0 && freshThisBoot(ts);
+        }
+        boolean repaired = false;
+        boolean repairNeedsRecheck = false;
+        if (rootLanded) {
+            if (zn.startsWith("zn-ok")) {
+                repaired = true;
+            } else if (zn.contains("softreboot")) {
+                repaired = true;
+                repairNeedsRecheck = true;
+            }
+            String mk = readTmpFile(ZN_REPAIR_MARK);
+            if (mk != null) {
+                long ts = 0;
+                String outcome = "";
+                for (String line : mk.split("\n")) {
+                    int eq = line.indexOf('=');
+                    if (eq < 0) {
+                        continue;
+                    }
+                    String k = line.substring(0, eq).trim();
+                    String v = line.substring(eq + 1).trim();
+                    if ("ts".equals(k)) {
+                        try {
+                            ts = Long.parseLong(v);
+                        } catch (NumberFormatException ignored) {
+                        }
+                    } else if ("outcome".equals(k)) {
+                        outcome = v;
+                    }
+                }
+                if (freshThisBoot(ts)) {
+                    repaired = true;
+                    if (outcome.contains("softreboot")) {
+                        repairNeedsRecheck = true;
+                    }
+                }
+            }
+        }
+        if (GhostRootService.running) {
+            return;
+        }
+        if (rootLanded) {
+            runButton.setEnabled(false);
+            runButton.setText("✅ 已提权（本 boot，重启后可再执行）");
+        } else {
+            runButton.setEnabled(true);
+            runButton.setText("开始执行");
+        }
+        if (repaired) {
+            repairButton.setEnabled(repairNeedsRecheck);
+            repairButton.setText(repairNeedsRecheck
+                    ? "已修复（软重启后建议再点复查）"
+                    : "✅ 已修复（本 boot）");
+        } else {
+            repairButton.setEnabled(true);
+            repairButton.setText(rootLanded ? "Zygisk 修复（提权后点我）"
+                    : "Zygisk 修复（需先提权）");
+        }
     }
 
     /** v26→v31: 用 .gr_state 心跳检测"上次任务因设备重启中断"。
@@ -360,6 +476,9 @@ public class MainActivity extends Activity {
                     runButton.setText("开始执行");
                     repairButton.setEnabled(true);
                     repairButton.setText("Zygisk 修复（提权后点我）");
+                    /* v49: 按任务结果刷新持久状态 —— 成功时按钮变为
+                     * 「已提权/已修复」并按需禁点，而非一律回到初始态 */
+                    refreshButtonStates();
                     getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 });
             }
