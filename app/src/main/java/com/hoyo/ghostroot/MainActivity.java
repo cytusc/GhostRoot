@@ -31,10 +31,15 @@ public class MainActivity extends Activity {
     private static final int REQ_PERMISSION = 1001;
     private static final String CLI_PATH = "/data/local/tmp/ghostlock";
     private static final String PROFILE_PATH = "/data/local/tmp/profile.bin";
-    /** v46: adb 自动化入口 —— `am start -a com.hoyo.ghostroot.action.ADB_RUN`。
+    /** v46/v51: adb 自动化入口 ——
+     *   `am start -a com.hoyo.ghostroot.action.ADB_RUN`    → 提权
+     *   `am start -a com.hoyo.ghostroot.action.ADB_REPAIR` → ZN 一键修复（提权后）
      * 仅接受 shell(2000)/root(0)/本应用 uid 的调用方（保持 P0 审查的防护语义：
-     * 普通第三方应用带着该 action 启动会被忽略）。 */
+     * 普通第三方应用带着该 action 启动会被忽略）。
+     * v51: 供 scripts/gr_autoloop.sh 在提权成功后触发修复并验证结果，
+     * 避免 UI 自动化（uiautomator 会被 GKD 抢占）点击按钮的脆弱性。 */
     private static final String ACTION_ADB_RUN = "com.hoyo.ghostroot.action.ADB_RUN";
+    private static final String ACTION_ADB_REPAIR = "com.hoyo.ghostroot.action.ADB_REPAIR";
 
     private TextView logView;
     private Button runButton;
@@ -76,34 +81,47 @@ public class MainActivity extends Activity {
         append("目标: " + CLI_PATH + " + " + PROFILE_PATH);
         append("模式: 纯手动 —— 打开本应用只检查 Shizuku 状态，点击按钮才开始执行");
         refreshStatus(true);
-        maybeHandleAdbRun(getIntent());
+        maybeHandleAdbAction(getIntent());
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        maybeHandleAdbRun(intent);
+        maybeHandleAdbAction(intent);
     }
 
-    /** v46: ADB 自动化触发 —— 验证调用方 uid 后延迟执行 onRunClicked。
-     * 延迟是为了让 Shizuku binder listener 先完成一次状态刷新。 */
-    private void maybeHandleAdbRun(Intent intent) {
-        if (intent == null || !ACTION_ADB_RUN.equals(intent.getAction())) {
+    /** v46/v51: ADB 自动化触发 —— 验证调用方 uid 后延迟执行对应按钮动作。
+     * 延迟是为了让 Shizuku binder listener 先完成一次状态刷新。
+     * ADB_RUN → onRunClicked()；ADB_REPAIR → onRepairClicked()（幂等修复链，
+     * 不检查按钮禁用态，已显示「已修复」时仍可复查）。 */
+    private void maybeHandleAdbAction(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        final String action = intent.getAction();
+        final boolean run = ACTION_ADB_RUN.equals(action);
+        final boolean repair = ACTION_ADB_REPAIR.equals(action);
+        if (!run && !repair) {
             return;
         }
         int uid = android.os.Binder.getCallingUid();
         if (uid != android.os.Process.SHELL_UID
                 && uid != android.os.Process.ROOT_UID
                 && uid != android.os.Process.myUid()) {
-            append("收到 ADB_RUN 但调用方 uid=" + uid + " 不在白名单，忽略");
+            append("收到 " + action + " 但调用方 uid=" + uid + " 不在白名单，忽略");
             return;
         }
-        append("ADB 触发执行（caller uid=" + uid + "），1.5s 后开始…");
+        append("ADB 触发" + (run ? "执行" : "ZN 修复")
+                + "（caller uid=" + uid + "），1.5s 后开始…");
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         runButton.postDelayed(() -> {
             if (!isFinishing()) {
-                onRunClicked();
+                if (run) {
+                    onRunClicked();
+                } else {
+                    onRepairClicked();
+                }
             }
         }, 1500L);
     }

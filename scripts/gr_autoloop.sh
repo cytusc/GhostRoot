@@ -6,6 +6,12 @@
 #   2) 动态解析 + 启动 Shizuku（每次重启都要重新授权）
 #   3) adb 触发 GhostRoot（am start -a ACTION_ADB_RUN）
 #   4) 判定提权：设备端 `su -c id` 返回 uid=0 即真值，命中即停
+#   5) 触发 ZN 一键修复（am start -a ACTION_ADB_REPAIR）并验证修复结果：
+#        · 本 boot 新鲜的 .gr_zn_repair 留痕（outcome=zn-ok*）
+#        · zygiskd status：zygote_states>=2 / 双模块已加载 / modules_with_issue=0
+#        · dex2oat-flags 不存在（工行兼容） + .abort_msg 闩锁不存在（daemon 可启）
+#        · outcome=zn-softreboot-scheduled 时等框架软重启恢复后再触发一次复查
+#      验证失败不回滚 root（提权结果已保留），但脚本以退出码 2 告知自动化
 #
 # 关键正确性（针对之前测试的几处坑）：
 #   - adb reboot 后**必须等真正掉线**再等上线，避免打在旧 boot 上（竞态）
@@ -17,6 +23,10 @@
 #   bash gr_autoloop.sh                 # 默认循环（MAX_ROUNDS=300）
 #   MAX_ROUNDS=0 bash gr_autoloop.sh    # 无限循环直到拿到 root
 #   VERIFY_TIMEOUT=120 SHIZUKU_WAIT=12 bash gr_autoloop.sh
+#   REPAIR_WAIT=60 SOFTREBOOT_WAIT=150 bash gr_autoloop.sh
+#
+# 退出码: 0=提权(+修复验证)完成或正常结束；2=提权成功但修复验证未通过
+# 依赖: GhostRoot >= v51（ACTION_ADB_REPAIR 入口，低版本 am start 会静默忽略）
 #
 set -u
 
@@ -29,6 +39,7 @@ a() { "$ADB" "$@"; }
 PKG="com.hoyo.ghostroot"
 SHIZUKU_PKG="moe.shizuku.privileged.api"
 ADB_RUN_ACTION="com.hoyo.ghostroot.action.ADB_RUN"
+ADB_REPAIR_ACTION="com.hoyo.ghostroot.action.ADB_REPAIR"
 EXPECTED_KERNEL="${EXPECTED_KERNEL:-5.15.197-g346b1c36bd5c-dirty}"  # 你手机实际内核
 EXPECTED_UAPI="${EXPECTED_UAPI:-5}"   # 本机内核(g346b1c36bd5c)的 KSU UAPI=5；/data/adb/ksud 若是 uapi2 会导致模块安装/sepolicy 注入全部失败
 
@@ -38,6 +49,15 @@ VERIFY_POLL="${VERIFY_POLL:-3}"         # 轮询间隔(秒)
 OFFLINE_WAIT="${OFFLINE_WAIT:-60}"      # 等真正掉线的上限(秒)
 ONLINE_WAIT="${ONLINE_WAIT:-90}"        # 等上线+boot_completed 的上限(秒)
 MAX_ROUNDS="${MAX_ROUNDS:-300}"         # 安全上限，0=无限
+
+# ---------- 提权后 ZN 修复验证配置 ----------
+REPAIR_TRIGGERS="${REPAIR_TRIGGERS:-3}"        # 触发重试次数（提权会话未收尾时 running 守卫会吞掉修复）
+REPAIR_WAIT="${REPAIR_WAIT:-45}"                # 每次触发后等待本 boot 修复留痕的秒数
+REPAIR_POLL="${REPAIR_POLL:-3}"                 # 留痕/终态轮询间隔(秒)
+REPAIR_SETTLE="${REPAIR_SETTLE:-5}"             # 留痕出现后等终态稳定的秒数
+SOFTREBOOT_WAIT="${SOFTREBOOT_WAIT:-120}"      # 框架软重启后等新 zygote 出现的上限(秒)
+REPAIR_VERIFY_TIMEOUT="${REPAIR_VERIFY_TIMEOUT:-90}"  # 终态（ZN/工行/闩锁）验证轮询上限(秒)
+SESSION_WAIT="${SESSION_WAIT:-90}"             # 等提权会话写出最终 verdict 的上限(秒)
 
 LOG_DIR="${HOME}/.cache/gr_autoloop"
 mkdir -p "$LOG_DIR"
@@ -164,6 +184,259 @@ trigger_ghostroot() {
     return 1
 }
 
+# ---------- 提权后：ZN 一键修复 + 结果验证 ----------
+# 等提权会话收尾：execute() 每轮开头删 .gr_verdict，finally 才重写；
+# 文件里重新出现 verdict= 行说明 usvc 已收尾，此时触发修复不会被
+# GhostRootService.running 守卫吞掉（v50 修复后 finish() 才会清 running）。
+wait_session_finished() {
+    local waited=0 v
+    while [ "$waited" -lt "$SESSION_WAIT" ]; do
+        v=$(a shell 'su -c "grep -c \"^verdict=\" /data/local/tmp/.gr_verdict 2>/dev/null"' 2>/dev/null | tr -d '\r')
+        if [ "${v:-0}" -ge 1 ]; then
+            log "提权会话已收尾（等待 ${waited}s）"
+            return 0
+        fi
+        sleep "$REPAIR_POLL"; waited=$((waited+REPAIR_POLL))
+    done
+    warn "提权会话 ${SESSION_WAIT}s 内未写出 verdict（可能仍在收尾），继续尝试修复"
+    return 1
+}
+
+# 触发走 am start -a ACTION_ADB_REPAIR（GhostRoot >= v51 的对称入口），
+# 不用 UI 点击：uiautomator 会被 GKD 抢占（POSTMORTEM 踩坑 #7）。
+trigger_repair() {
+    local n out
+    for n in 1 2 3; do
+        if [ "$(adb_state)" != "device" ]; then
+            warn "修复触发前 adb 不在线（第 $n 次），5s 后重试"
+            sleep 5
+            continue
+        fi
+        # -f 0x14000000 = NEW_TASK|CLEAR_TOP：提权后 MainActivity 仍在前台时，
+        # 裸 am start 会复用现有 Activity 而**不重新投递 intent**（实测
+        # 2026-11-04：第二次触发没跑修复链、App 日志无新记录）。CLEAR_TOP
+        # 强制重建 Activity → onCreate/onNewIntent 必收 action。
+        out=$(a shell "am start -a $ADB_REPAIR_ACTION -n $PKG/.MainActivity -f 0x14000000" 2>&1 | tr -d '\r')
+        echo "$out" | tee -a "$TEE_LOG" >/dev/null
+        if echo "$out" | grep -q "Starting"; then
+            log "→ 已触发 ZN 修复（第 $n 次尝试）"
+            return 0
+        fi
+        warn "修复触发未成功（第 $n 次）：$out"
+        sleep 5
+    done
+    return 1
+}
+
+# 本 boot 新鲜的修复留痕 → 输出 "ts outcome"；否则返回 1。
+# 时钟与 uptime 全部取设备侧，避免 PC/设备时钟偏差；留痕 ts 是 epoch
+# （RootUserService 写 System.currentTimeMillis()/1000），新鲜判据
+# age ∈ [-5, uptime]，与 App 的 freshThisBoot 同一语义。
+repair_mark() {
+    local raw ts outcome dev_now dev_up age
+    raw=$(a shell 'su -c "cat /data/local/tmp/.gr_zn_repair 2>/dev/null"' 2>/dev/null | tr -d '\r')
+    [ -z "$raw" ] && return 1
+    ts=$(echo "$raw" | grep -oE 'ts=[0-9]+' | head -1 | cut -d= -f2)
+    outcome=$(echo "$raw" | grep -oE 'outcome=[^[:space:]]+' | head -1 | cut -d= -f2)
+    [ -z "$ts" ] && return 1
+    dev_now=$(a shell 'date +%s' 2>/dev/null | tr -d '\r')
+    dev_up=$(a shell 'cut -d" " -f1 /proc/uptime' 2>/dev/null | tr -d '\r')
+    [ -z "$dev_now" ] || [ -z "$dev_up" ] && return 1
+    age=$((dev_now - ts))
+    if [ "$age" -lt -5 ] || [ "$age" -gt "${dev_up%.*}" ]; then
+        return 1
+    fi
+    echo "$ts ${outcome:-unknown}"
+}
+
+# zygiskd status 权威判据：双 zygote 注入 + 两个 Zygisk 模块（64/32）已载 + 0 issues
+zn_status_ok() {
+    local st zygotes issues m64 m32
+    st=$(a shell 'su -c "/data/adb/modules/zygisksu/bin/zygiskd status 2>/dev/null"' 2>/dev/null | tr -d '\r')
+    [ -z "$st" ] && return 1
+    zygotes=$(echo "$st" | grep -oE 'zygote_states:[0-9]+' | head -1 | cut -d: -f2)
+    issues=$(echo "$st" | grep -oE 'modules_with_issue:[0-9]+' | head -1 | cut -d: -f2)
+    m64=$(echo "$st" | grep '^modules64:' | head -1)
+    m32=$(echo "$st" | grep '^modules32:' | head -1)
+    ZN_STATUS_SUMMARY="zygote_states=${zygotes:-?} issues=${issues:-?} ${m64:-?} ${m32:-?}"
+    [ "${zygotes:-0}" -ge 2 ] || return 1
+    [ "${issues:-1}" -eq 0 ] || return 1
+    echo "$m64" | grep -q 'hma_oss_zygisk' || return 1
+    echo "$m64" | grep -q 'zygisk_vector' || return 1
+    echo "$m32" | grep -q 'hma_oss_zygisk' || return 1
+    echo "$m32" | grep -q 'zygisk_vector' || return 1
+    return 0
+}
+
+# 修复副作用：dex2oat-flags 必须不存在（工行兼容）+ .abort_msg 闩锁必须清掉
+# （否则下次 daemon 秒退循环复发，POSTMORTEM 问题5）
+repair_side_ok() {
+    local latch prop
+    latch=$(a shell 'su -c "ls /data/adb/zygisksu/.abort_msg 2>/dev/null"' 2>/dev/null | tr -d '\r')
+    prop=$(a shell 'su -c "/data/adb/ksu/bin/resetprop dalvik.vm.dex2oat-flags 2>&1"' 2>/dev/null | tr -d '\r')
+    REPAIR_SIDE_SUMMARY="abort_latch=${latch:-absent} dex2oat_flags=${prop:-unreadable}"
+    [ -z "$latch" ] || return 1
+    echo "$prop" | grep -q 'not found' || return 1
+    return 0
+}
+
+verify_repair_terminal() {
+    local waited=0
+    while [ "$waited" -lt "$REPAIR_VERIFY_TIMEOUT" ]; do
+        if zn_status_ok && repair_side_ok; then
+            return 0
+        fi
+        sleep "$REPAIR_POLL"; waited=$((waited+REPAIR_POLL))
+    done
+    return 1
+}
+
+# 框架软重启（stop/start）的恢复判据：zygote64 pid 变化。
+# 只看 adb 在线/boot_completed 会假阳性（stop 期间两者可能都还是旧值）。
+wait_framework_recovery() {
+    local boot0="$1" z0 z1 waited=0 b
+    z0=$(a shell 'pidof zygote64 2>/dev/null' 2>/dev/null | tr -d '\r')
+    log "软重启前 zygote64 pid=${z0:-?}，等待新 zygote（上限 ${SOFTREBOOT_WAIT}s）…"
+    while [ "$waited" -lt "$SOFTREBOOT_WAIT" ]; do
+        if [ "$(adb_state)" = "device" ]; then
+            b=$(get_boot_id)
+            if [ -n "$b" ] && [ "$b" != "$boot0" ]; then
+                warn "等待期间 boot_id 变化($boot0 -> $b)：整机重启而非框架软重启"
+                return 1
+            fi
+            z1=$(a shell 'pidof zygote64 2>/dev/null' 2>/dev/null | tr -d '\r')
+            if [ -n "$z1" ] && [ "$z1" != "${z0:-}" ]; then
+                log "框架已重生（zygote64 pid ${z0:-?} -> ${z1}，耗时 ${waited}s）"
+                return 0
+            fi
+        fi
+        sleep 2; waited=$((waited+2))
+    done
+    warn "框架软重启后 ${SOFTREBOOT_WAIT}s 内未见新 zygote"
+    return 1
+}
+
+# 主流程：触发修复 → 等本 boot 留痕 → （必要时软重启复查）→ 终态验证 → 报告
+run_repair_and_verify() {
+    local boot0="$1" try waited mark="" ts="n/a" outcome="no-mark" recheck_ok=0
+    local baseline_ts=0 fresh_mark=0 evidence="terminal-only" new_ts="" pre=""
+    log "---- 提权后 ZN 修复 + 结果验证 ----"
+
+    # 本 boot 可能已有留痕（会话自愈成功/用户手点过修复）。记录触发前 ts
+    # 作为基线，只认「本次触发产生的新留痕」—— 否则旧留痕会让验证 0s
+    # 假通过（实测 2026-11-04：第二次裸 am start 未投递 intent，脚本却因
+    # 旧留痕判定通过，App 日志里根本没有第二次修复链）。
+    if pre=$(repair_mark); then
+        baseline_ts=$(echo "$pre" | awk '{print $1}')
+        log "本 boot 已有修复留痕 ts=${baseline_ts}，本次触发需产生更新留痕"
+    fi
+
+    # 提权会话收尾前 GhostRootService.running=true 会吞掉修复请求，
+    # 先等最终 verdict 落地再发（失败不阻塞，后面还有触发重试兜底）
+    wait_session_finished || true
+
+    # 「触发 → 等新留痕」重试：任何一轮被吞/失败都能自愈
+    try=1
+    while [ "$try" -le "$REPAIR_TRIGGERS" ]; do
+        if trigger_repair; then
+            waited=0
+            while [ "$waited" -lt "$REPAIR_WAIT" ]; do
+                if mark=$(repair_mark); then
+                    new_ts=$(echo "$mark" | awk '{print $1}')
+                    if [ "${new_ts:-0}" -gt "$baseline_ts" ]; then
+                        fresh_mark=1
+                        evidence="fresh-mark"
+                        log "  捕获本次触发的新留痕（第 $try 次触发后 ${waited}s）"
+                        break 2
+                    fi
+                fi
+                sleep "$REPAIR_POLL"; waited=$((waited+REPAIR_POLL))
+            done
+            warn "第 $try 次触发后 ${REPAIR_WAIT}s 内未见新留痕（可能仍被 running 守卫吞掉）"
+        else
+            warn "第 $try 次修复触发失败"
+        fi
+        try=$((try+1))
+        sleep 5
+    done
+
+    if [ -n "$mark" ]; then
+        ts=$(echo "$mark" | awk '{print $1}')
+        outcome=$(echo "$mark" | awk '{print $2}')
+        [ -n "$outcome" ] || outcome="unknown"
+        log "修复留痕: ts=$ts outcome=${outcome}（evidence=${evidence}）"
+    fi
+    if [ "$fresh_mark" -ne 1 ]; then
+        warn "本次触发未产生新留痕（App 可能已处于已修复态或服务忙碌）→ 以终态判据为准"
+    fi
+
+    # 过程证据分支：softreboot 需等框架恢复后复查；无留痕/异常留痕不直接
+    # 判负 —— 终态（ZN status + 工行/闩锁）才是「修复结果」的最终判据
+    case "$outcome" in
+        zn-ok*)
+            :
+            ;;
+        *softreboot*)
+            log "修复安排了框架软重启（~40s），等待恢复后再触发一次复查…"
+            if ! wait_framework_recovery "$boot0"; then
+                warn "框架软重启未恢复或 boot_id 变化，修复验证失败"
+                return 1
+            fi
+            sleep "$REPAIR_SETTLE"
+            # 复查同样要求「新于复查前基线」的 zn-ok 留痕
+            if pre=$(repair_mark); then
+                baseline_ts=$(echo "$pre" | awk '{print $1}')
+            fi
+            try=1
+            while [ "$try" -le "$REPAIR_TRIGGERS" ]; do
+                if trigger_repair; then
+                    waited=0
+                    while [ "$waited" -lt "$REPAIR_WAIT" ]; do
+                        if mark=$(repair_mark); then
+                            new_ts=$(echo "$mark" | awk '{print $1}')
+                            outcome=$(echo "$mark" | awk '{print $2}')
+                            if [ "${new_ts:-0}" -gt "$baseline_ts" ] \
+                                    && echo "${outcome:-}" | grep -q '^zn-ok'; then
+                                recheck_ok=1
+                                evidence="fresh-mark(recheck)"
+                                break 2
+                            fi
+                        fi
+                        sleep "$REPAIR_POLL"; waited=$((waited+REPAIR_POLL))
+                    done
+                fi
+                try=$((try+1))
+                sleep 5
+            done
+            if [ "$recheck_ok" -ne 1 ]; then
+                warn "软重启后复查未得到新的 zn-ok 留痕（outcome=${outcome:-?}）"
+                return 1
+            fi
+            log "软重启后复查: outcome=$outcome"
+            ;;
+        *)
+            warn "修复留痕缺失或非成功态（outcome=${outcome}），转以终态判据验证"
+            ;;
+    esac
+
+    sleep "$REPAIR_SETTLE"
+    if verify_repair_terminal; then
+        log "✓ 修复结果验证通过（evidence=${evidence}）"
+        log "  ZN:        ${ZN_STATUS_SUMMARY:-unknown}"
+        log "  工行/闩锁: ${REPAIR_SIDE_SUMMARY:-unknown}"
+        {
+            echo "==== ZN REPAIR VERIFIED at $(date) ===="
+            echo "boot_id:     $boot0"
+            echo "repair_mark: ts=$ts outcome=$outcome evidence=$evidence"
+            echo "zn_status:   ${ZN_STATUS_SUMMARY:-unknown}"
+            echo "side_checks: ${REPAIR_SIDE_SUMMARY:-unknown}"
+        } | tee -a "$TEE_LOG"
+        return 0
+    fi
+    warn "✗ 修复终态验证失败：ZN=${ZN_STATUS_SUMMARY:-unknown} 工行/闩锁=${REPAIR_SIDE_SUMMARY:-unknown}"
+    return 1
+}
+
 # ---------- 提权真值判定 ----------
 root_ok() {
     local out
@@ -257,6 +530,7 @@ ensure_ready || die "初始设备未就绪"
 TESTED_BOOT=""
 SHIZ_FAIL=0
 ROUND=0
+REPAIR_RESULT=""
 while true; do
     [ "$MAX_ROUNDS" -gt 0 ] && [ "$ROUND" -ge "$MAX_ROUNDS" ] && { warn "已达 MAX_ROUNDS，停止"; break; }
     ROUND=$((ROUND+1))
@@ -318,6 +592,14 @@ while true; do
             echo "su -c id:"
             a shell 'su -c id 2>/dev/null' 2>/dev/null | tr -d '\r'
         } | tee -a "$TEE_LOG"
+        # v51: 提权成功 ≠ 全栈可用 —— ZN 注入/Vector/dex2oat 副作用还要
+        # 靠修复链闭环，且必须验证结果（留痕 + status + 工行/闩锁）
+        if run_repair_and_verify "$BOOT"; then
+            REPAIR_RESULT="OK"
+        else
+            REPAIR_RESULT="FAIL"
+            warn "ZN 修复验证未通过（root 已到手，不回滚；详情见上方日志）"
+        fi
         break
     else
         warn "本 boot 未提权"
@@ -326,4 +608,8 @@ while true; do
     fi
 done
 
-log "===== 循环结束 (rounds=$ROUND) ====="
+log "===== 循环结束 (rounds=$ROUND, repair=${REPAIR_RESULT:-not-run}) ====="
+# 自动化可感知：提权成功但修复未通过 → 非零退出（root 结果日志仍完整保留）
+if [ "$REPAIR_RESULT" = "FAIL" ]; then
+    exit 2
+fi
