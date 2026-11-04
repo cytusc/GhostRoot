@@ -289,6 +289,11 @@ public class MainActivity extends Activity {
             }
             rootLanded = verdict == 0 && freshThisBoot(ts);
         }
+        /* v49: 判定过程留痕 —— 按钮状态判定链任何一环（读文件/时钟/解析）
+         * 失败都会静默回到初始按钮态，logcat 是唯一可观测点 */
+        android.util.Log.i("GR_UI", "refresh: vf=" + (vf == null ? "null" : vf.length() + "B")
+                + " uptime=" + readUptimeSeconds() + "s rootLanded=" + rootLanded
+                + " zn=" + zn + " repaired=" + (zn.startsWith("zn-ok")));
         boolean repaired = false;
         boolean repairNeedsRecheck = false;
         if (rootLanded) {
@@ -404,13 +409,12 @@ public class MainActivity extends Activity {
     }
 
     private float readUptimeSeconds() {
-        try {
-            String s = readTmpFile("/proc/uptime").trim();
-            int sp = s.indexOf(' ');
-            return Float.parseFloat(sp > 0 ? s.substring(0, sp) : s);
-        } catch (Throwable t) {
-            return 0f;
-        }
+        /* v49: 改用 SystemClock.elapsedRealtime —— 实测 /proc/uptime 在
+         * app 域被 dontaudit 静默拒绝（GR_UI 日志 uptime=0.0s，且 avc 不
+         * 留痕），此前 showInterruptedBanner 的"重启中断"判定因此从未
+         * 生效过。elapsedRealtime 含 deep sleep、与 uptime 同基准，
+         * 无需任何权限。 */
+        return android.os.SystemClock.elapsedRealtime() / 1000f;
     }
 
     private String readTmpFile(String path) {
