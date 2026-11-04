@@ -275,6 +275,16 @@ public class RootUserService extends IRootRunner.Stub {
                                         + " uptime=" + readUptime() + "s outcome=" + r + "\n",
                                 false);
                         log(callback, "修复留痕: " + TMP + "/.gr_zn_repair");
+                        /* v51: 同步回写 verdict 的 zn= 字段 —— 否则 UI 的
+                         * 「已修复」判定（读 verdict zn 前缀）永远停留在
+                         * 会话留下的旧值（如 zn-softreboot-scheduled），
+                         * 修复按钮永远停在「软重启后建议再点复查」态。
+                         * 只替换 zn= 行，不动 ts/session/verdict（rootLanded
+                         * 的本 boot 时效判定依赖原 ts）。 */
+                        if (!VERDICT_FILE.isEmpty()) {
+                            rootShell("sed -i 's/^zn=.*/zn=" + r + "/' " + VERDICT_FILE
+                                    + " 2>/dev/null", 10);
+                        }
                     }
                 }
             } catch (Throwable e) {
