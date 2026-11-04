@@ -356,6 +356,13 @@ run_repair_and_verify() {
         die "提权后等待会话收尾期间 boot_id 变化（崩溃重启），root 已随重启丢失，修复无从谈起"
     fi
 
+    # 框架软重启（自愈/上次修复调度）会带走 adb 启动的 Shizuku server
+    # （实测 13:48：server 死后 am start 送达 MainActivity，但 onRepairClicked
+    # 的 Shizuku 检查失败，请求根本没到 usvc，App 日志无「ZN 一键修复开始」）
+    # → 修复触发前幂等重启 Shizuku
+    log "确保 Shizuku server 在线（框架软重启会杀死 adb 启动的 server）…"
+    start_shizuku || warn "Shizuku 启动失败，修复触发可能到不了 usvc"
+
     # 「触发 → 等新留痕」重试：任何一轮被吞/失败都能自愈
     try=1
     while [ "$try" -le "$REPAIR_TRIGGERS" ]; do
@@ -414,6 +421,7 @@ run_repair_and_verify() {
             if pre=$(repair_mark); then
                 baseline_ts=$(echo "$pre" | awk '{print $1}')
             fi
+            start_shizuku || warn "复查前 Shizuku 启动失败"
             try=1
             while [ "$try" -le "$REPAIR_TRIGGERS" ]; do
                 if trigger_repair; then
