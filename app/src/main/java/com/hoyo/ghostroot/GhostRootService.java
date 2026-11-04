@@ -309,6 +309,12 @@ public class GhostRootService extends Service {
         running = true;
         finished = false;
         repairMode = true;
+        /* v49.1: 必须置位 pendingRepair —— connection.onServiceConnected
+         * 按 pendingReboot/pendingRepair/提权 三分支分发，此标志漏置会让
+         * 修复请求 fall-through 到 prepareSession+startRun()，把修复按钮
+         * 变成一次完整的 exploit 已落地快速路径（实测 2026-11-04：verdict
+         * 被 session=none/round=0 重写、.gr_zn_repair 永不产生）。 */
+        pendingRepair = true;
         synchronized (BUF) {
             BUF.clear();
         }
@@ -325,6 +331,7 @@ public class GhostRootService extends Service {
             emit("bind failed: " + t);
             running = false;
             repairMode = false;
+            pendingRepair = false;
             abort();
         }
     }
@@ -451,6 +458,11 @@ public class GhostRootService extends Service {
         nm.notify(SUMMARY_ID, notify(verdict == 0 ? "✅ " + verdictText + "：" + detail
                 : (verdict == 1 ? "❓ " + verdictText + "：" + detail : "❌ " + verdictText + "：" + detail)));
         Sink s = sink;
+        /* v49.1: running 必须先于 onDone 清零 —— onDone 在主线程内联执行时
+         * 会调 refreshButtonStates()，其 running 守卫若还挂着就提前 return，
+         * 按钮停留在 onDone 恢复的初始可点态（实测：修复完成后两按钮全亮，
+         * 「已提权/已修复」禁点态不生效，2026-11-04 用户实测复现）。 */
+        running = false;
         if (s != null) {
             try {
                 s.onDone(code, verdict, detail);
@@ -462,7 +474,6 @@ public class GhostRootService extends Service {
              * 页面，页面重开时仍会回放一次，这是预期行为。） */
             lastDoneConsumed = true;
         }
-        running = false;
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }
