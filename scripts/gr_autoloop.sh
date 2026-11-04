@@ -220,7 +220,7 @@ uapi_guard() {
         log "uapi guard: /data/adb/ksud uapi$u ok"
         return 0
     fi
-    warn "uapi guard: ksud uapi${u:-?} != 期望 uapi$EXPECTED_UAPI，尝试换用 /data/local/tmp/ksud-gk"
+    warn "uapi guard: ksud uapi${u:-?} != 期望 uapi${EXPECTED_UAPI}，尝试换用 /data/local/tmp/ksud-gk"
     # 备源检查：ksud-gk 不在设备上则无能为力（只告警，不失败——root 本身已到手）
     if ! a shell 'ls /data/local/tmp/ksud-gk >/dev/null 2>&1'; then
         warn "uapi guard: /data/local/tmp/ksud-gk 不存在，跳过替换（请手动处理）"
