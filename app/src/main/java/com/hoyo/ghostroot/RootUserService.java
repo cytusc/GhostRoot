@@ -1085,10 +1085,23 @@ public class RootUserService extends IRootRunner.Stub {
      * 同 boot 防死循环：20 分钟内只安排一次。 */
     private String zygiskAutoActivate(ILogCallback callback) {
         try {
+            // v49 自愈前置：先清 ZN 闩锁与自禁用。LKM 时序竞态（zygote ~20s 启动
+            // > exploit ~50s 落地）下 ZN post-fs-data 注入必失败，会写
+            // .abort_msg 闩锁 + disable 自禁用；不清则后续 daemon 拒启、
+            // soft-reboot 后无人接驾注入新 zygote（POSTMORTEM-20261104 问题5）。
+            rootShell("rm -f /data/adb/zygisksu/.abort_msg " + ZN_MODDIR + "/disable", 10);
             ShellResult st = rootShell(ZN_BIN + " status 2>/dev/null", 20);
             if (st.timedOut || !st.ok()) {
-                /* 模块不存在 / 状态不可读 —— 不动系统 */
-                return "zn-absent";
+                /* v49：daemon 可能已被闩锁/竞态杀掉 —— 先补一个单例再重读状态，
+                 * 仍失败才判 zn-absent（此前 status 失败直接放弃自愈是链路缺口） */
+                rootShell("cd " + ZN_MODDIR + " && setsid nohup ./bin/zygiskd daemon "
+                        + ">/dev/null 2>&1 </dev/null &", 10);
+                Thread.sleep(2000);
+                st = rootShell(ZN_BIN + " status 2>/dev/null", 20);
+                if (st.timedOut || !st.ok()) {
+                    /* 模块不存在 / 状态不可读 —— 不动系统 */
+                    return "zn-absent";
+                }
             }
             int zygotes = parseFieldInt(st.out, "zygote_states");
             int daemons = pidCount("zn-daemon");
@@ -1103,6 +1116,7 @@ public class RootUserService extends IRootRunner.Stub {
                 log(callback, "zygisk: single-instance daemon -> zn-daemon=" + daemons);
             }
             if (zygotes > 0 && daemons >= 1) {
+                deleteDex2oatFlags(callback, "zn-ok");
                 return "zn-ok-zygote" + zygotes;
             }
             File mark = new File(ZN_SOFTREBOOT_MARK);
@@ -1116,12 +1130,27 @@ public class RootUserService extends IRootRunner.Stub {
                     + " uptime=" + readUptime() + "s zygotes=" + zygotes + "\n", false);
             rootShell("setsid sh -c 'sleep 6; stop; sleep 4; start' "
                     + ">/dev/null 2>&1 </dev/null &", 8);
+            // v49: 用户决策（保工行）—— 软重启后 vector zygisk 模块在新 zygote
+            // 初始化时会重设 dex2oat-flags（工行闪退根因，POSTMORTEM 问题1），
+            // 延迟 ~120s 追加清除一次，盖住"prop 在会话结束后才被设置"的时序。
+            rootShell("setsid sh -c 'sleep 120; /data/adb/ksu/bin/resetprop "
+                    + "--delete dalvik.vm.dex2oat-flags' >/dev/null 2>&1 </dev/null &", 8);
             log(callback, "zygisk: zygote NOT hooked (late-load race) -> framework soft reboot "
                     + "scheduled; ZN will catch the fresh zygote (~40s)");
             return "zn-softreboot-scheduled";
         } catch (Throwable e) {
             return "zn-error:" + e.getClass().getSimpleName();
         }
+    }
+
+    /** v49: dex2oat-flags 清除（用户决策 2026-11-04：保工行，接受 vector
+     * 内联优化失效，AdClose 拦截功能不受影响）。vector 的 zygisk 模块在
+     * 新 zygote 初始化时会重设该 prop —— 本方法只压"激活窗口"内的设置，
+     * vectord 自行重启仍可能复活（根治需改 vector 侧脚本，见 P1 遗留）。 */
+    private void deleteDex2oatFlags(ILogCallback callback, String tag) {
+        rootShell("/data/adb/ksu/bin/resetprop --delete "
+                + "dalvik.vm.dex2oat-flags 2>/dev/null", 10);
+        log(callback, "zygisk: dex2oat-flags cleared (" + tag + ") —— ICBC 保活策略");
     }
 
     /** v41: pidof 计数（0=未运行）。zn-daemon 是 zygiskd 的进程名 —— 按
