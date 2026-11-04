@@ -27,6 +27,8 @@ public class GhostRootService extends Service {
 
     public static final String ACTION_RUN = "RUN";
     public static final String ACTION_REBOOT = "REBOOT";
+    /** v49: ZN 一键修复 —— 提权成功后手机端手动触发，不依赖 PC。 */
+    public static final String ACTION_ZN_REPAIR = "ZN_REPAIR";
 
     /** Activity 注册的日志出口（同进程，静态即可）。 v25:
      * verdict 三态（0=成功 / 1=未知 / -1=失败），未知再也不能在
@@ -101,6 +103,10 @@ public class GhostRootService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private boolean finished = false;
     private boolean pendingReboot = false;
+    /** v49: 修复任务标记 —— connection 接通后走 znRepair 而非 exploit run；
+     * finish() 据此跳过 .gr_verdict 解析（修复不产生结果文件）。 */
+    private boolean pendingRepair = false;
+    private boolean repairMode = false;
     private IRootRunner runner;
     private Shizuku.UserServiceArgs serviceArgs;
     /** v32: 本次会话开始时刻（秒）。finish() 校验 .gr_verdict 的 ts 必须
@@ -123,6 +129,19 @@ public class GhostRootService extends Service {
                 runner.rebootDevice();
             } catch (Throwable t) {
                 emit("reboot failed: " + t);
+            }
+            return;
+        }
+        if (pendingRepair) {
+            /* v49: 修复不走 prepareSession（不产生/消费 .gr_verdict） */
+            pendingRepair = false;
+            emit("root 服务已连接（uid 2000 通道就绪），下发 ZN 修复链…");
+            try {
+                runner.znRepair(callback);
+            } catch (Throwable t) {
+                emit("znRepair failed: " + t);
+                running = false;
+                main.post(() -> finish(-1));
             }
             return;
         }
@@ -173,7 +192,10 @@ public class GhostRootService extends Service {
                 .daemon(false)
                 .processNameSuffix("root")
                 .debuggable(false)
-                .version(33);
+                /* v49: AIDL 新增 znRepair —— 版本必须 bump 让 Shizuku 停掉
+                 * 旧接口的 UserService 进程，否则 binder 调 znRepair 会
+                 * NoSuchMethod。 */
+                .version(34);
     }
 
     @Override
@@ -185,6 +207,8 @@ public class GhostRootService extends Service {
             main.post(this::beginRun);
         } else if (intent != null && ACTION_REBOOT.equals(intent.getAction())) {
             main.post(this::beginReboot);
+        } else if (intent != null && ACTION_ZN_REPAIR.equals(intent.getAction())) {
+            main.post(this::beginRepair);
         } else {
             // 没有明确的手动指令 → 不执行任何东西，直接退出
             emit("未收到手动执行指令，服务退出");
@@ -259,6 +283,52 @@ public class GhostRootService extends Service {
         }
     }
 
+    /** v49: 手动触发的 ZN 修复入口。守卫序列与 beginRun 相同（复制而非
+     * 抽取 —— beginRun 的会话 ID/结果文件语义不适用于修复，强行共用
+     * 会把修复任务牵进 exploit 的 verdict 生命周期）。 */
+    private void beginRepair() {
+        if (running) {
+            emit("已有任务在执行中，忽略本次修复");
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            stopSelf();
+            return;
+        }
+        if (finished) {
+            return;
+        }
+        if (!Shizuku.pingBinder()) {
+            emit("Shizuku 未运行，取消修复");
+            abort();
+            return;
+        }
+        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+            emit("Shizuku 未授权，取消修复（请打开 GhostRoot 点按钮重新授权）");
+            abort();
+            return;
+        }
+        running = true;
+        finished = false;
+        repairMode = true;
+        synchronized (BUF) {
+            BUF.clear();
+        }
+        lastDone = null;
+        lastDoneDetail = null;
+        lastDoneConsumed = false;
+        emit("Shizuku 就绪，绑定 root 服务（修复模式）…");
+        try {
+            /* 与 beginRun 同理：先停旧 UserService，拿干净实例执行修复 */
+            Shizuku.unbindUserService(serviceArgs, connection, true);
+            runner = null;
+            Shizuku.bindUserService(serviceArgs, connection);
+        } catch (Throwable t) {
+            emit("bind failed: " + t);
+            running = false;
+            repairMode = false;
+            abort();
+        }
+    }
+
     /** 手动触发的重启入口（失败后快速进入下一轮干净堆）。 */
     private void beginReboot() {
         if (runner != null) {
@@ -315,7 +385,16 @@ public class GhostRootService extends Service {
         /* v33: 严格会话绑定 —— session 字段必须与本次下发的 ID 完全一致；
          * 时间窗口降级为辅助合理性检查。旧结果从此不可能串用。 */
         boolean sessionMatches = pv.valid && sessionId.equals(pv.session);
-        if (pv.valid && sessionMatches && tsSane) {
+        if (repairMode) {
+            /* v49: 修复任务不产生/不消费 .gr_verdict —— 结果直接由 znRepair
+             * 的 rc 决定；verdict 文件解析在这里属串用（旧 exploit 结果会
+             * 冒充修复结论），故跳过 pv 分支。 */
+            verdict = code == 0 ? 0 : -1;
+            detail = code == 0 ? "zn-repair=ok（自愈链结论与 status 见上方日志）"
+                    : code == 3 ? "zn-repair: root 未落地（su 不可用）—— 先提权再修复"
+                    : code == 2 ? "zn-repair: 已有任务在执行中"
+                    : "zn-repair failed exit=" + code;
+        } else if (pv.valid && sessionMatches && tsSane) {
             verdict = pv.verdict;
             detail = "exit=" + code + " round=" + pv.round + " enforce="
                     + (pv.enforce == null ? "UNKNOWN" : pv.enforce) + " ksu=" + pv.ksu
@@ -360,8 +439,11 @@ public class GhostRootService extends Service {
                     + (modules == null ? " KSU状态不可读" : (ksu ? " KSU已加载" : " KSU未加载"))
                     + (landed ? " [landed但无su验证证据]" : "");
         }
-        String verdictText = verdict == 0 ? "ROOT 成功(已验证)"
-                : (verdict == 1 ? "结果未知" : "未成功");
+        /* v49: 修复模式的结论措辞与提权分开 —— "ROOT 成功"会误导 */
+        String verdictText = repairMode
+                ? (verdict == 0 ? "ZN 修复完成" : "修复未成功")
+                : (verdict == 0 ? "ROOT 成功(已验证)"
+                : (verdict == 1 ? "结果未知" : "未成功"));
         emit(verdictText + " " + detail);
         lastDone = new int[]{code, verdict};
         lastDoneDetail = detail;

@@ -10,4 +10,9 @@ interface IRootRunner {
     void prepareSession(String sessionId);
     void run(String cliPath, String profilePath, int settleSeconds, ILogCallback callback);
     void rebootDevice();
+    /** v49: ZN 一键修复 —— 手机端手动触发的 Zygisk Next 自愈链：
+     * 清闩锁/自禁用 -> 补单例 daemon -> zygote_states 判定（必要时软重启） ->
+     * dex2oat-flags 清除（工行保活）-> 状态回读。rc: 0=完成, 2=忙碌,
+     * 3=root 未落地, 其他=失败。 */
+    void znRepair(ILogCallback callback);
 }

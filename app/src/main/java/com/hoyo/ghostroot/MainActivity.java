@@ -39,6 +39,8 @@ public class MainActivity extends Activity {
     private TextView logView;
     private Button runButton;
     private Button rebootButton;
+    /** v49: ZN 一键修复 —— 提权成功后手机端自愈，不依赖 PC。 */
+    private Button repairButton;
     /** v26: sink 做成字段，onResume 自动重挂 —— Activity 被销毁重建后
      * 也能继续收到日志与结束回调（服务端有缓冲回放）。 */
     private GhostRootService.Sink activitySink;
@@ -167,6 +169,15 @@ public class MainActivity extends Activity {
         root.addView(runButton, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        /* v49: 提权成功后的 ZN 自愈链手动入口 —— 清闩锁/拉 daemon/
+         * dex2oat-flags 清除（工行保活）/状态回读，全程手机端完成 */
+        repairButton = new Button(this);
+        repairButton.setText("Zygisk 修复（提权后点我）");
+        repairButton.setEnabled(true);
+        repairButton.setOnClickListener(v -> onRepairClicked());
+        root.addView(repairButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         rebootButton = new Button(this);
         rebootButton.setText("重启手机（快速重试下一轮）");
         rebootButton.setOnClickListener(v -> onRebootClicked());
@@ -206,6 +217,9 @@ public class MainActivity extends Activity {
             GhostRootService.attach(activitySink);
             runButton.setEnabled(false);
             runButton.setText("运行中…");
+            /* v49: 修复任务同样会被重连 —— 两按钮一并冻结，结束回调里统一恢复 */
+            repairButton.setEnabled(false);
+            repairButton.setText("修复中…");
             getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             append("已重新连接正在执行的任务（历史日志已回放）");
         } else if (GhostRootService.hasPendingResult()) {
@@ -307,32 +321,45 @@ public class MainActivity extends Activity {
             @Override
             public void onDone(int code, int verdict, String detail) {
                 runOnUiThread(() -> {
-                    String v = verdict == 0 ? "ROOT 成功(已验证)" : (verdict == 1 ? "结果未知" : "未成功");
-                    append("=== 结束 exit=" + code + " " + v + " (" + detail + ") ===");
-                    if (verdict == 0) {
-                        /* v32: root 成功 ≠ 管理器可用 —— 按 magica 结果分流 */
-                        boolean managerOk = detail.contains("magica=manager-patched")
-                                || detail.contains("magica=already-patched");
-                        if (managerOk) {
-                            append("✅ 现在可以打开 KernelSU 管理器（32680 版）使用了");
-                        } else {
-                            append("⚠️ root 成功，但管理器补丁状态未确认（" 
-                                    + "magica 结果见 detail）——打开管理器前先在 PC 跑 fix.sh");
+                    /* v49: 修复任务的结论措辞与提权分开 —— detail 带
+                     * zn-repair 标记（GhostRootService.finish 写入） */
+                    if (detail != null && detail.contains("zn-repair")) {
+                        append("=== " + (verdict == 0 ? "✅ Zygisk 修复完成" 
+                                : "❌ 修复未成功: " + detail) + " ===");
+                        if (verdict == 0) {
+                            append("若安排了框架软重启，~40s 后回来再点一次「Zygisk 修复」复查终态");
                         }
-                        if (code != 0) {
-                            /* v28: rc 是 exploit 进程退出码，与身份验证无关 */
-                            append("注: native exit=" + code + " 只是 exploit 进程退出码；"
-                                    + "身份以 su -c id 的 uid=0 为准，勿以 rc 判定成败");
-                        }
-                    } else if (code == -2) {
-                        append("⚠️ 执行前中止（预检失败）：一般是设备文件缺失或 profile md5 不匹配，看上方日志找原因");
-                    } else if (verdict == 1) {
-                        append("❓ 结果未知：若设备已重启，等自启后直接再来一发（结果详见通知与 logcat）");
                     } else {
-                        append("提示: 点「重启手机」进入下一轮 —— 重启后 90 秒内点「开始执行」");
+                        String v = verdict == 0 ? "ROOT 成功(已验证)" : (verdict == 1 ? "结果未知" : "未成功");
+                        append("=== 结束 exit=" + code + " " + v + " (" + detail + ") ===");
+                        if (verdict == 0) {
+                            /* v32: root 成功 ≠ 管理器可用 —— 按 magica 结果分流 */
+                            boolean managerOk = detail.contains("magica=manager-patched")
+                                    || detail.contains("magica=already-patched");
+                            if (managerOk) {
+                                append("✅ 现在可以打开 KernelSU 管理器（32680 版）使用了；"
+                                        + "建议顺手点「Zygisk 修复」把模块链拉起来");
+                            } else {
+                                append("⚠️ root 成功，但管理器补丁状态未确认（"
+                                        + "magica 结果见 detail）——打开管理器前先在 PC 跑 fix.sh");
+                            }
+                            if (code != 0) {
+                                /* v28: rc 是 exploit 进程退出码，与身份验证无关 */
+                                append("注: native exit=" + code + " 只是 exploit 进程退出码；"
+                                        + "身份以 su -c id 的 uid=0 为准，勿以 rc 判定成败");
+                            }
+                        } else if (code == -2) {
+                            append("⚠️ 执行前中止（预检失败）：一般是设备文件缺失或 profile md5 不匹配，看上方日志找原因");
+                        } else if (verdict == 1) {
+                            append("❓ 结果未知：若设备已重启，等自启后直接再来一发（结果详见通知与 logcat）");
+                        } else {
+                            append("提示: 点「重启手机」进入下一轮 —— 重启后 90 秒内点「开始执行」");
+                        }
                     }
                     runButton.setEnabled(true);
                     runButton.setText("开始执行");
+                    repairButton.setEnabled(true);
+                    repairButton.setText("Zygisk 修复（提权后点我）");
                     getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 });
             }
@@ -375,6 +402,45 @@ public class MainActivity extends Activity {
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         append("----- 开始执行（手动触发）-----");
         Intent intent = new Intent(this, GhostRootService.class).setAction(GhostRootService.ACTION_RUN);
+        startForegroundService(intent);
+    }
+
+    /** v49: ZN 一键修复入口 —— 守卫与 onRunClicked 相同（Shizuku 就绪是
+     * 硬前提：修复经 UserService 的 su 通道执行），区别只在 action 与按钮态。 */
+    private void onRepairClicked() {
+        if (GhostRootService.running) {
+            GhostRootService.attach(activitySink);
+            repairButton.setEnabled(false);
+            repairButton.setText("修复中…");
+            append("已有任务在执行中，已为你重新接上日志");
+            return;
+        }
+        if (!shizukuInstalled()) {
+            append("Shizuku 未安装，无法修复");
+            return;
+        }
+        if (!Shizuku.pingBinder()) {
+            append("Shizuku 未运行：先打开 Shizuku 用无线调试启动，再回来点");
+            return;
+        }
+        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+            append("请求 Shizuku 授权…");
+            try {
+                Shizuku.requestPermission(REQ_PERMISSION);
+            } catch (Throwable t) {
+                append("请求授权失败: " + t);
+            }
+            return;
+        }
+        if (activitySink == null) {
+            activitySink = makeSink();
+        }
+        GhostRootService.sink = activitySink;
+        repairButton.setEnabled(false);
+        repairButton.setText("修复中…");
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        append("----- ZN 一键修复（手动触发）-----");
+        Intent intent = new Intent(this, GhostRootService.class).setAction(GhostRootService.ACTION_ZN_REPAIR);
         startForegroundService(intent);
     }
 

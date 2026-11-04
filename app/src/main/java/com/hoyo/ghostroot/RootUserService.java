@@ -117,6 +117,9 @@ public class RootUserService extends IRootRunner.Stub {
 
     private final Context context;
     private final AtomicBoolean running = new AtomicBoolean(false);
+    /** v49: znRepair 的守卫位 —— 与 run() 的 running 分开，修复与提权
+     * 互斥（同时跑会互抢 shell/ptrace），但状态互不污染。 */
+    private final AtomicBoolean repairing = new AtomicBoolean(false);
     /** v39: kmsg 采集器可管理句柄 —— 此前线程/logcat 子进程即起即弃，任务
      * 收尾无法回收、重复启动会叠加采集器（review 2026-11-02 确认的缺陷）。 */
     private Thread kmsgFollowerThread;
@@ -206,6 +209,72 @@ public class RootUserService extends IRootRunner.Stub {
             return;
         }
         Thread worker = new Thread(() -> execute(cliPath, profilePath, settleSeconds, callback), "ghostroot-run");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /** v49: ZN 一键修复（手机端手动触发，不依赖 PC）。
+     * 与 run() 用不同守卫位 —— 修复与提权互斥但互不干扰状态。
+     * 链路复用 zygiskAutoActivate（v49 已含闩锁前置清除 + status 失败补
+     * daemon），手动语义额外保证：无论命中哪条分支都清一次 dex2oat-flags
+     * （幂等），盖住 cooldown/absent 分支不清理的空档。
+     * rc: 0=完成, 2=忙碌, 3=root 未落地, 其他=失败。 */
+    @Override
+    public void znRepair(ILogCallback callback) {
+        if (!repairing.compareAndSet(false, true)) {
+            try {
+                callback.onLog("another repair is already in progress");
+                callback.onDone(2);
+            } catch (RemoteException ignored) {
+            }
+            return;
+        }
+        Thread worker = new Thread(() -> {
+            int exit = 0;
+            try {
+                log(callback, "===== ZN 一键修复开始（手动触发）=====");
+                /* 修复链全部走 su —— root 未落地时任何动作都没有意义，
+                 * 明确报 3 让 UI 提示先提权，而不是让一串 shell 失败淹没原因 */
+                ShellResult who = rootShell("id -u", 10);
+                String uid = who.out == null ? "" : who.out.trim();
+                if (!who.ok() || !"0".equals(uid)) {
+                    log(callback, "root 未落地（id -u = " + uid + "）—— 先「开始执行」提权，再回来修复");
+                    exit = 3;
+                } else {
+                    log(callback, "root 就绪（uid=0），进入自愈链…");
+                    String r = zygiskAutoActivate(callback);
+                    log(callback, "自愈链结论: " + r);
+                    /* 手动语义兜底：幂等清除 dex2oat-flags（工行保活，
+                     * 用户决策 2026-11-04） */
+                    deleteDex2oatFlags(callback, "repair");
+                    /* 终态回读 —— 用户要的是"修没修好"的直观证据 */
+                    ShellResult st = rootShell(ZN_BIN + " status 2>/dev/null", 20);
+                    if (st.ok() && st.out != null) {
+                        for (String line : st.out.split("\n")) {
+                            String l = line.trim();
+                            if (l.startsWith("zygote_states") || l.startsWith("zygote_state_")
+                                    || l.startsWith("modules64") || l.startsWith("modules32")
+                                    || l.startsWith("modules_with_issue")) {
+                                log(callback, "status: " + l);
+                            }
+                        }
+                    } else {
+                        log(callback, "status 不可读（daemon 可能仍未起）");
+                    }
+                    log(callback, "提示: 若上面安排了 soft-reboot，框架将重启 ~40s，"
+                            + "期间界面卡住属正常；结束后可再点一次「Zygisk 修复」复查终态");
+                }
+            } catch (Throwable e) {
+                log(callback, "repair error: " + e);
+                exit = 1;
+            } finally {
+                repairing.set(false);
+            }
+            try {
+                callback.onDone(exit);
+            } catch (RemoteException ignored) {
+            }
+        }, "ghostroot-zn-repair");
         worker.setDaemon(true);
         worker.start();
     }
