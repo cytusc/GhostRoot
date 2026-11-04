@@ -323,7 +323,21 @@ run_repair_and_verify() {
     # 提权 boot 丢失检测：LKM root 不跨重启，崩溃重启后 su 必消失，
     # 继续触发修复只会空转（实测 2026-11-04 13:36：落地 14s 后崩溃重启，
     # 脚本在新 boot 上又盲试了 3 次修复，全被 znRepair root 门禁拒绝）
-    boot_lost() { [ "$(get_boot_id)" != "$boot0" ]; }
+    # 注意：boot_id 读到空串 ≠ boot 丢失 —— adb 瞬断/框架软重启期间
+    # shell 可能短暂失败（实测 13:46 误报）。空值视为 unknown，重试；
+    # 只有读到「非空且 != boot0」才判定丢失。
+    boot_lost() {
+        local v n
+        for n in 1 2 3; do
+            v=$(get_boot_id)
+            if [ -n "$v" ]; then
+                [ "$v" != "$boot0" ] && return 0
+                return 1
+            fi
+            sleep 2
+        done
+        return 1   # 连续空读：unknown，按未丢失处理（宁可多试不误杀）
+    }
     log "---- 提权后 ZN 修复 + 结果验证 ----"
 
     # 本 boot 可能已有留痕（会话自愈成功/用户手点过修复）。记录触发前 ts
