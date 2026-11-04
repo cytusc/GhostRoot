@@ -320,6 +320,10 @@ wait_framework_recovery() {
 run_repair_and_verify() {
     local boot0="$1" try waited mark="" ts="n/a" outcome="no-mark" recheck_ok=0
     local baseline_ts=0 fresh_mark=0 evidence="terminal-only" new_ts="" pre=""
+    # 提权 boot 丢失检测：LKM root 不跨重启，崩溃重启后 su 必消失，
+    # 继续触发修复只会空转（实测 2026-11-04 13:36：落地 14s 后崩溃重启，
+    # 脚本在新 boot 上又盲试了 3 次修复，全被 znRepair root 门禁拒绝）
+    boot_lost() { [ "$(get_boot_id)" != "$boot0" ]; }
     log "---- 提权后 ZN 修复 + 结果验证 ----"
 
     # 本 boot 可能已有留痕（会话自愈成功/用户手点过修复）。记录触发前 ts
@@ -334,13 +338,22 @@ run_repair_and_verify() {
     # 提权会话收尾前 GhostRootService.running=true 会吞掉修复请求，
     # 先等最终 verdict 落地再发（失败不阻塞，后面还有触发重试兜底）
     wait_session_finished || true
+    if boot_lost; then
+        die "提权后等待会话收尾期间 boot_id 变化（崩溃重启），root 已随重启丢失，修复无从谈起"
+    fi
 
     # 「触发 → 等新留痕」重试：任何一轮被吞/失败都能自愈
     try=1
     while [ "$try" -le "$REPAIR_TRIGGERS" ]; do
+        if boot_lost; then
+            die "修复触发期间 boot_id 变化（崩溃重启），root 已丢失，停止修复验证"
+        fi
         if trigger_repair; then
             waited=0
             while [ "$waited" -lt "$REPAIR_WAIT" ]; do
+                if boot_lost; then
+                    die "等留痕期间 boot_id 变化（崩溃重启），root 已丢失，停止修复验证"
+                fi
                 if mark=$(repair_mark); then
                     new_ts=$(echo "$mark" | awk '{print $1}')
                     if [ "${new_ts:-0}" -gt "$baseline_ts" ]; then
@@ -420,6 +433,9 @@ run_repair_and_verify() {
     esac
 
     sleep "$REPAIR_SETTLE"
+    if boot_lost; then
+        die "终态验证前 boot_id 变化（崩溃重启），root 已丢失，修复结果作废"
+    fi
     if verify_repair_terminal; then
         log "✓ 修复结果验证通过（evidence=${evidence}）"
         log "  ZN:        ${ZN_STATUS_SUMMARY:-unknown}"
