@@ -316,6 +316,53 @@ wait_framework_recovery() {
     return 1
 }
 
+# ---------- Root 直连修复（绕开 Shizuku 依赖） ----------
+# 提权成功后脚本手里就有 root（uid=0），修复链全是 shell 动作，直接 su -c
+# 执行即可 —— 不依赖 Shizuku server（框架软重启会杀死 adb 启动的 server，
+# 实测 13:48）也不依赖 App 端授权（用户实测 14:24：每 boot 修复前还要在
+# 手机上点一次 Shizuku 允许）。与 App znRepair 同语义：
+#   清闩锁/自禁用 → 确保 daemon → (zygote=0 时调度软重启) →
+#   幂等清 dex2oat-flags → 写留痕 → 回写 verdict zn=
+repair_via_root() {
+    local ZN=/data/adb/modules/zygisksu ZND=/data/adb/zygisksu
+    local RP=/data/adb/ksu/bin/resetprop
+    local st zygotes out now up
+
+    # 1) 前置清闩锁 + 自禁用（ZN 秒退双根因之一，POSTMORTEM 问题5）
+    a shell "su -c 'rm -f $ZND/.abort_msg $ZN/disable $ZN/module.prop.orig'" >/dev/null 2>&1
+
+    # 2) 读状态；daemon 无响应则按正确 CWD 拉起（cd 模块目录是隐式配置）
+    st=$(a shell "su -c '$ZN/bin/zygiskd status 2>/dev/null'" | tr -d '\r')
+    zygotes=$(echo "$st" | sed -n 's/^zygote_states://p')
+    if [ -z "$zygotes" ]; then
+        log "  zygiskd 无响应 → 拉起 daemon（CWD=模块目录）"
+        a shell "su -c 'cd $ZN && setsid ./bin/zygiskd daemon >/dev/null 2>&1 </dev/null &'" >/dev/null 2>&1
+        sleep 3
+        st=$(a shell "su -c '$ZN/bin/zygiskd status 2>/dev/null'" | tr -d '\r')
+        zygotes=$(echo "$st" | sed -n 's/^zygote_states://p')
+    fi
+    log "  zygiskd status: zygote_states=${zygotes:-unknown}"
+
+    # 3) 幂等清 dex2oat-flags（工行兼容，无论走哪条分支都清）
+    a shell "su -c '$RP --delete dalvik.vm.dex2oat-flags'" >/dev/null 2>&1
+
+    # 4) 结论 + 留痕 + verdict zn= 回写（UI「已修复」判定的依据）
+    if [ "${zygotes:-0}" -ge 1 ]; then
+        out="zn-ok-zygote${zygotes}"
+    else
+        out="zn-softreboot-scheduled"
+        log "  zygote 未挂钩 → 调度框架软重启（stop;start，~40s）"
+        a shell "su -c 'setsid sh -c \"sleep 2; stop; sleep 4; start\" >/dev/null 2>&1 </dev/null &'" >/dev/null 2>&1
+    fi
+    now=$(a shell 'date +%s' | tr -d '\r')
+    up=$(a shell "cat /proc/uptime" | awk '{print $1}')
+    a shell "su -c 'echo \"ts=${now} uptime=${up}s outcome=${out}\" > /data/local/tmp/.gr_zn_repair'" >/dev/null 2>&1
+    # verdict 可能还没有 zn= 行（首次）→ 先替换后补加
+    a shell "su -c 'sed -i \"s/^zn=.*/zn=${out}/\" /data/local/tmp/.gr_verdict; grep -q \"^zn=\" /data/local/tmp/.gr_verdict || echo \"zn=${out}\" >> /data/local/tmp/.gr_verdict'" >/dev/null 2>&1
+    log "  root 直连修复完成: outcome=${out}（留痕 + verdict zn= 已回写）"
+    return 0
+}
+
 # 主流程：触发修复 → 等本 boot 留痕 → （必要时软重启复查）→ 终态验证 → 报告
 run_repair_and_verify() {
     local boot0="$1" try waited mark="" ts="n/a" outcome="no-mark" recheck_ok=0
@@ -356,43 +403,66 @@ run_repair_and_verify() {
         die "提权后等待会话收尾期间 boot_id 变化（崩溃重启），root 已随重启丢失，修复无从谈起"
     fi
 
-    # 框架软重启（自愈/上次修复调度）会带走 adb 启动的 Shizuku server
-    # （实测 13:48：server 死后 am start 送达 MainActivity，但 onRepairClicked
-    # 的 Shizuku 检查失败，请求根本没到 usvc，App 日志无「ZN 一键修复开始」）
-    # → 修复触发前幂等重启 Shizuku
-    log "确保 Shizuku server 在线（框架软重启会杀死 adb 启动的 server）…"
-    start_shizuku || warn "Shizuku 启动失败，修复触发可能到不了 usvc"
-
-    # 「触发 → 等新留痕」重试：任何一轮被吞/失败都能自愈
-    try=1
-    while [ "$try" -le "$REPAIR_TRIGGERS" ]; do
+    # 优先 root 直连修复：不依赖 Shizuku server 生命周期与 App 端授权
+    # （Shizuku 路径降级为兜底，仅在 root 修复未产出新留痕时启用）
+    if boot_lost; then
+        die "修复前 boot_id 变化（崩溃重启），root 已丢失，修复无从谈起"
+    fi
+    repair_via_root
+    waited=0
+    while [ "$waited" -lt "$REPAIR_WAIT" ]; do
         if boot_lost; then
-            die "修复触发期间 boot_id 变化（崩溃重启），root 已丢失，停止修复验证"
+            die "等留痕期间 boot_id 变化（崩溃重启），root 已丢失，停止修复验证"
         fi
-        if trigger_repair; then
-            waited=0
-            while [ "$waited" -lt "$REPAIR_WAIT" ]; do
-                if boot_lost; then
-                    die "等留痕期间 boot_id 变化（崩溃重启），root 已丢失，停止修复验证"
-                fi
-                if mark=$(repair_mark); then
-                    new_ts=$(echo "$mark" | awk '{print $1}')
-                    if [ "${new_ts:-0}" -gt "$baseline_ts" ]; then
-                        fresh_mark=1
-                        evidence="fresh-mark"
-                        log "  捕获本次触发的新留痕（第 $try 次触发后 ${waited}s）"
-                        break 2
-                    fi
-                fi
-                sleep "$REPAIR_POLL"; waited=$((waited+REPAIR_POLL))
-            done
-            warn "第 $try 次触发后 ${REPAIR_WAIT}s 内未见新留痕（可能仍被 running 守卫吞掉）"
-        else
-            warn "第 $try 次修复触发失败"
+        if mark=$(repair_mark); then
+            new_ts=$(echo "$mark" | awk '{print $1}')
+            if [ "${new_ts:-0}" -gt "$baseline_ts" ]; then
+                fresh_mark=1
+                evidence="root-repair"
+                log "  捕获 root 直连修复的新留痕（${waited}s）"
+                break
+            fi
         fi
-        try=$((try+1))
-        sleep 5
+        sleep "$REPAIR_POLL"; waited=$((waited+REPAIR_POLL))
     done
+
+    # 兜底：root 直连未产出新留痕（异常场景）→ 回退 ADB_REPAIR intent
+    # （需 Shizuku：server 在线 + App 端已授权）
+    if [ "$fresh_mark" -ne 1 ]; then
+        warn "root 直连修复未产出新留痕，回退 ADB_REPAIR intent 触发（需 Shizuku）"
+        log "确保 Shizuku server 在线（框架软重启会杀死 adb 启动的 server）…"
+        start_shizuku || warn "Shizuku 启动失败，修复触发可能到不了 usvc"
+        # 「触发 → 等新留痕」重试：任何一轮被吞/失败都能自愈
+        try=1
+        while [ "$try" -le "$REPAIR_TRIGGERS" ]; do
+            if boot_lost; then
+                die "修复触发期间 boot_id 变化（崩溃重启），root 已丢失，停止修复验证"
+            fi
+            if trigger_repair; then
+                waited=0
+                while [ "$waited" -lt "$REPAIR_WAIT" ]; do
+                    if boot_lost; then
+                        die "等留痕期间 boot_id 变化（崩溃重启），root 已丢失，停止修复验证"
+                    fi
+                    if mark=$(repair_mark); then
+                        new_ts=$(echo "$mark" | awk '{print $1}')
+                        if [ "${new_ts:-0}" -gt "$baseline_ts" ]; then
+                            fresh_mark=1
+                            evidence="fresh-mark"
+                            log "  捕获本次触发的新留痕（第 $try 次触发后 ${waited}s）"
+                            break 2
+                        fi
+                    fi
+                    sleep "$REPAIR_POLL"; waited=$((waited+REPAIR_POLL))
+                done
+                warn "第 $try 次触发后 ${REPAIR_WAIT}s 内未见新留痕（可能仍被 running 守卫吞掉）"
+            else
+                warn "第 $try 次修复触发失败"
+            fi
+            try=$((try+1))
+            sleep 5
+        done
+    fi
 
     if [ -n "$mark" ]; then
         ts=$(echo "$mark" | awk '{print $1}')
@@ -421,25 +491,29 @@ run_repair_and_verify() {
             if pre=$(repair_mark); then
                 baseline_ts=$(echo "$pre" | awk '{print $1}')
             fi
-            start_shizuku || warn "复查前 Shizuku 启动失败"
+            # 复查用 root 直连（不依赖 Shizuku——软重启后 server 必死）
+            repair_via_root
             try=1
             while [ "$try" -le "$REPAIR_TRIGGERS" ]; do
-                if trigger_repair; then
-                    waited=0
-                    while [ "$waited" -lt "$REPAIR_WAIT" ]; do
-                        if mark=$(repair_mark); then
-                            new_ts=$(echo "$mark" | awk '{print $1}')
-                            outcome=$(echo "$mark" | awk '{print $2}')
-                            if [ "${new_ts:-0}" -gt "$baseline_ts" ] \
-                                    && echo "${outcome:-}" | grep -q '^zn-ok'; then
-                                recheck_ok=1
-                                evidence="fresh-mark(recheck)"
-                                break 2
-                            fi
+                waited=0
+                while [ "$waited" -lt "$REPAIR_WAIT" ]; do
+                    if boot_lost; then
+                        die "复查期间 boot_id 变化（崩溃重启），root 已丢失，停止修复验证"
+                    fi
+                    if mark=$(repair_mark); then
+                        new_ts=$(echo "$mark" | awk '{print $1}')
+                        outcome=$(echo "$mark" | awk '{print $2}')
+                        if [ "${new_ts:-0}" -gt "$baseline_ts" ] \
+                                && echo "${outcome:-}" | grep -q '^zn-ok'; then
+                            recheck_ok=1
+                            evidence="root-repair(recheck)"
+                            break 2
                         fi
-                        sleep "$REPAIR_POLL"; waited=$((waited+REPAIR_POLL))
-                    done
-                fi
+                    fi
+                    sleep "$REPAIR_POLL"; waited=$((waited+REPAIR_POLL))
+                done
+                # 未得到 zn-ok → 可能 zygote 还没挂上，再跑一次修复链重试
+                repair_via_root
                 try=$((try+1))
                 sleep 5
             done
