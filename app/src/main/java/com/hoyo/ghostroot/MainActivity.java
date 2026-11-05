@@ -46,6 +46,10 @@ public class MainActivity extends Activity {
     private Button rebootButton;
     /** v49: ZN 一键修复 —— 提权成功后手机端自愈，不依赖 PC。 */
     private Button repairButton;
+    /** v62: root 启动 Shizuku —— 提权成功后用 su 直接拉起 server，
+     * 不依赖 PC / 无线调试；启动完即可点「Zygisk 修复」。 */
+    private Button shizukuRootButton;
+    private static final String BTN_SHIZUKU_ROOT = "启动 Shizuku（root，提权后点我）";
     /** v26: sink 做成字段，onResume 自动重挂 —— Activity 被销毁重建后
      * 也能继续收到日志与结束回调（服务端有缓冲回放）。 */
     private GhostRootService.Sink activitySink;
@@ -197,6 +201,16 @@ public class MainActivity extends Activity {
         repairButton.setEnabled(true);
         repairButton.setOnClickListener(v -> onRepairClicked());
         root.addView(repairButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        /* v62: root 启动 Shizuku —— 提权成功（KSU root 在）后，用 su 直接拉起
+         * Shizuku server，免去 PC/无线调试；与 Shizuku App 的「通过 Root 启动」
+         * 同语义。首次点击会弹 KSU 授权框（给 GhostRoot 授权 su），允许后永久。 */
+        shizukuRootButton = new Button(this);
+        shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
+        shizukuRootButton.setEnabled(true);
+        shizukuRootButton.setOnClickListener(v -> onStartShizukuRootClicked());
+        root.addView(shizukuRootButton, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         rebootButton = new Button(this);
@@ -699,6 +713,93 @@ public class MainActivity extends Activity {
         append("----- ZN 一键修复（手动触发）-----");
         Intent intent = new Intent(this, GhostRootService.class).setAction(GhostRootService.ACTION_ZN_REPAIR);
         startForegroundService(intent);
+    }
+
+    /** v62: root 启动 Shizuku server。前置：本 boot 已提权（KSU root 在）。
+     * 流程：su 探测（首次弹 KSU 授权框，等待 ≤25s）→ su nohup 拉起
+     * libshizuku.so（脱离 App 进程，adb 断开不受影响）→ 轮询 binder ≤20s。
+     * 注意：root 启动的 server 授权记录存 Shizuku App 数据目录，与 adb 启动
+     * （存 /data/local/tmp/）不同源 —— 两种方式切换后 GhostRoot 需重新授权
+     * 一次（本 App 授权已持久，切换后第一次绑定会弹一次授权）。 */
+    private void onStartShizukuRootClicked() {
+        if (!shizukuInstalled()) {
+            append("Shizuku 未安装，无法启动");
+            return;
+        }
+        if (Shizuku.pingBinder()) {
+            append("Shizuku 已在运行，无需启动");
+            return;
+        }
+        final android.content.pm.ApplicationInfo ai;
+        try {
+            ai = getPackageManager().getApplicationInfo(SHIZUKU_PACKAGE, 0);
+        } catch (Exception e) {
+            append("解析 Shizuku 安装路径失败: " + e);
+            return;
+        }
+        final String bin = ai.nativeLibraryDir + "/libshizuku.so";
+        shizukuRootButton.setEnabled(false);
+        shizukuRootButton.setText("启动中…");
+        final Thread t = new Thread(() -> {
+            try {
+                /* v62: 后台线程内所有 UI 更新（含日志）必须 runOnUiThread ——
+                 * v53 踩过的 CalledFromWrongThreadException 坑（append 直调
+                 * logView 只能在主线程） */
+                runOnUiThread(() -> append("root 探测（首次会弹 KernelSU 授权框，请允许 GhostRoot）…"));
+                Process su = Runtime.getRuntime().exec(new String[]{"su", "-c", "id"});
+                boolean rootOk = false;
+                long deadline = System.currentTimeMillis() + 25_000L;
+                while (System.currentTimeMillis() < deadline) {
+                    try {
+                        if (su.exitValue() == 0) {
+                            rootOk = true;
+                            break;
+                        }
+                    } catch (IllegalThreadStateException ignored) {
+                    }
+                    Thread.sleep(500);
+                }
+                if (!rootOk) {
+                    su.destroyForcibly();
+                    runOnUiThread(() -> {
+                        append("✗ root 未就绪（超时）：请先「开始执行」提权，"
+                                + "或在 KernelSU 管理器里给 GhostRoot 授权 su");
+                        shizukuRootButton.setEnabled(true);
+                        shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
+                    });
+                    return;
+                }
+                runOnUiThread(() -> append("root 就绪 → 启动 Shizuku server…"));
+                Process start = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                        "nohup '" + bin + "' >/dev/null 2>&1 &"});
+                start.waitFor();
+                for (int i = 0; i < 10; i++) {
+                    Thread.sleep(2000);
+                    if (Shizuku.pingBinder()) {
+                        runOnUiThread(() -> {
+                            append("✅ Shizuku 已启动（root）—— 现在可以点「Zygisk 修复」");
+                            shizukuRootButton.setText("✅ Shizuku 已启动（root）");
+                            shizukuRootButton.setEnabled(true);
+                            refreshStatus(false);
+                        });
+                        return;
+                    }
+                }
+                runOnUiThread(() -> {
+                    append("✗ Shizuku 20s 内未上线（server 可能启动失败，"
+                            + "可在 Shizuku App 内查看日志）");
+                    shizukuRootButton.setEnabled(true);
+                    shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    append("启动 Shizuku 失败: " + e);
+                    shizukuRootButton.setEnabled(true);
+                    shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
+                });
+            }
+        });
+        t.start();
     }
 
     private void onRebootClicked() {
