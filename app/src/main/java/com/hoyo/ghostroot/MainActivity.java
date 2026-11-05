@@ -34,12 +34,15 @@ public class MainActivity extends Activity {
     /** v46/v51: adb 自动化入口 ——
      *   `am start -a com.hoyo.ghostroot.action.ADB_RUN`    → 提权
      *   `am start -a com.hoyo.ghostroot.action.ADB_REPAIR` → ZN 一键修复（提权后）
+     *   `am start -a com.hoyo.ghostroot.action.ADB_START_SHIZUKU` → root 启动 Shizuku
      * 仅接受 shell(2000)/root(0)/本应用 uid 的调用方（保持 P0 审查的防护语义：
      * 普通第三方应用带着该 action 启动会被忽略）。
      * v51: 供 scripts/gr_autoloop.sh 在提权成功后触发修复并验证结果，
-     * 避免 UI 自动化（uiautomator 会被 GKD 抢占）点击按钮的脆弱性。 */
+     * 避免 UI 自动化（uiautomator 会被 GKD 抢占）点击按钮的脆弱性。
+     * v63: 第三个入口让 root 启动 Shizuku 也能被 adb 端到端验证/排障。 */
     private static final String ACTION_ADB_RUN = "com.hoyo.ghostroot.action.ADB_RUN";
     private static final String ACTION_ADB_REPAIR = "com.hoyo.ghostroot.action.ADB_REPAIR";
+    private static final String ACTION_ADB_START_SHIZUKU = "com.hoyo.ghostroot.action.ADB_START_SHIZUKU";
 
     private TextView logView;
     private Button runButton;
@@ -109,7 +112,8 @@ public class MainActivity extends Activity {
         final String action = intent.getAction();
         final boolean run = ACTION_ADB_RUN.equals(action);
         final boolean repair = ACTION_ADB_REPAIR.equals(action);
-        if (!run && !repair) {
+        final boolean startShizuku = ACTION_ADB_START_SHIZUKU.equals(action);
+        if (!run && !repair && !startShizuku) {
             return;
         }
         int uid = android.os.Binder.getCallingUid();
@@ -119,15 +123,17 @@ public class MainActivity extends Activity {
             append("收到 " + action + " 但调用方 uid=" + uid + " 不在白名单，忽略");
             return;
         }
-        append("ADB 触发" + (run ? "执行" : "ZN 修复")
+        append("ADB 触发 " + (run ? "执行" : repair ? "ZN 修复" : "root 启动 Shizuku")
                 + "（caller uid=" + uid + "），1.5s 后开始…");
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         runButton.postDelayed(() -> {
             if (!isFinishing()) {
                 if (run) {
                     onRunClicked();
-                } else {
+                } else if (repair) {
                     onRepairClicked();
+                } else {
+                    onStartShizukuRootClicked();
                 }
             }
         }, 1500L);
@@ -737,69 +743,172 @@ public class MainActivity extends Activity {
             append("解析 Shizuku 安装路径失败: " + e);
             return;
         }
-        final String bin = ai.nativeLibraryDir + "/libshizuku.so";
+        final String binFromApi = ai.nativeLibraryDir + "/libshizuku.so";
+        final String logPath = "/data/local/tmp/gr_shizuku_root.log";
         shizukuRootButton.setEnabled(false);
         shizukuRootButton.setText("启动中…");
         final Thread t = new Thread(() -> {
+            /* v62 踩坑：后台线程内所有 UI 更新必须 runOnUiThread
+             * （CalledFromWrongThreadException）。v63 沿用。 */
             try {
-                /* v62: 后台线程内所有 UI 更新（含日志）必须 runOnUiThread ——
-                 * v53 踩过的 CalledFromWrongThreadException 坑（append 直调
-                 * logView 只能在主线程） */
-                runOnUiThread(() -> append("root 探测（首次会弹 KernelSU 授权框，请允许 GhostRoot）…"));
-                Process su = Runtime.getRuntime().exec(new String[]{"su", "-c", "id"});
+                ui(() -> append("----- root 启动 Shizuku -----"));
+
+                /* 1) root 探测：循环重试覆盖 KSU 首次授权弹窗；判据用输出含
+                 * uid=0 而非 exitValue —— 有的 su 实现 exit 0 但并未真提权。 */
+                String id = "";
                 boolean rootOk = false;
+                boolean hinted = false;
                 long deadline = System.currentTimeMillis() + 25_000L;
                 while (System.currentTimeMillis() < deadline) {
-                    try {
-                        if (su.exitValue() == 0) {
-                            rootOk = true;
-                            break;
-                        }
-                    } catch (IllegalThreadStateException ignored) {
+                    id = suOutput("id");
+                    if (id.contains("uid=0")) {
+                        rootOk = true;
+                        break;
                     }
-                    Thread.sleep(500);
+                    /* v63 实测踩坑：首次使用若 KernelSU 没给 GhostRoot 授权 su，
+                     * 屏幕上会弹授权框而这里静默等到 25s 超时，用户只看到
+                     * 「启动失败」却不知道该点哪里 —— 必须立刻显式提示。 */
+                    if (!hinted) {
+                        hinted = true;
+                        ui(() -> append("⚠ 等待 KernelSU 超级用户授权："
+                                + "请在弹出的授权框点「允许」（首次使用必做）…"));
+                    }
+                    Thread.sleep(1000);
                 }
                 if (!rootOk) {
-                    su.destroyForcibly();
-                    runOnUiThread(() -> {
-                        append("✗ root 未就绪（超时）：请先「开始执行」提权，"
-                                + "或在 KernelSU 管理器里给 GhostRoot 授权 su");
-                        shizukuRootButton.setEnabled(true);
-                        shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
+                    final String why = id.isEmpty() ? "su 无输出/被拒绝（KSU 授权？）" : id;
+                    ui(() -> {
+                        append("✗ root 未就绪: " + why
+                                + " —— 请先「开始执行」提权，或在 KernelSU 里给 GhostRoot 授权 su");
+                        resetShizukuRootButton();
                     });
                     return;
                 }
-                runOnUiThread(() -> append("root 就绪 → 启动 Shizuku server…"));
-                Process start = Runtime.getRuntime().exec(new String[]{"su", "-c",
-                        "nohup '" + bin + "' >/dev/null 2>&1 &"});
-                start.waitFor();
-                for (int i = 0; i < 10; i++) {
+                final String rootId = id;
+                ui(() -> append("root 就绪: " + rootId.replace('\n', ' ')));
+
+                /* 2) starter 路径双保险：nativeLibraryDir 在部分 ROM 上会指向
+                 * 不存在的 ABI 目录，回退到 pm path 推导（gr_autoloop 已验证路径）。 */
+                String bin = binFromApi;
+                String chk = suOutput("[ -x '" + bin + "' ] && echo OK || echo MISSING");
+                ui(() -> append("starter(nativeLibraryDir): " + binFromApi + " → " + chk));
+                if (!chk.contains("OK")) {
+                    String alt = suOutput("pm path " + SHIZUKU_PACKAGE
+                            + " | head -1 | sed 's|^package:||; s|base.apk$|lib/arm64/libshizuku.so|'");
+                    String altChk = alt.isEmpty() ? "MISSING" : suOutput("[ -x '" + alt + "' ] && echo OK || echo MISSING");
+                    ui(() -> append("starter(pm path 回退): " + alt + " → " + altChk));
+                    if (altChk.contains("OK")) {
+                        bin = alt;
+                    } else {
+                        ui(() -> {
+                            append("✗ 找不到可执行的 libshizuku.so，无法启动");
+                            resetShizukuRootButton();
+                        });
+                        return;
+                    }
+                }
+
+                /* 3) 关键修复：setsid 让 starter 脱离 su 会话的进程组/session。
+                 * v62 用 nohup 只忽略 SIGHUP，su 会话结束时 ksud 清理进程组会
+                 * 把刚拉起的 server 一起带走 —— 表现为「启动失败、server 无进程」。
+                 * stdin 必须 </dev/null，并把 starter 输出落盘便于排障。 */
+                final String binFinal = bin;
+                String launch = suOutput("rm -f '" + logPath + "'; setsid '" + binFinal
+                        + "' </dev/null >'" + logPath + "' 2>&1 & echo launched");
+                ui(() -> append("已投递 starter: " + launch.replace('\n', ' ')));
+
+                /* 4) 双判据轮询：pidof 证明 server 进程活着，pingBinder 证明
+                 * 本 App 拿到了 binder。只判 pingBinder 会把「server 已起但
+                 * 未绑定」误报成「启动失败」。 */
+                String pid = "";
+                boolean binder = false;
+                for (int i = 0; i < 14; i++) {
                     Thread.sleep(2000);
-                    if (Shizuku.pingBinder()) {
-                        runOnUiThread(() -> {
-                            append("✅ Shizuku 已启动（root）—— 现在可以点「Zygisk 修复」");
+                    pid = suOutput("pidof shizuku_server");
+                    binder = Shizuku.pingBinder();
+                    if (!pid.isEmpty() && binder) {
+                        final String okPid = pid;
+                        ui(() -> {
+                            append("✅ Shizuku 已启动（root，pid=" + okPid + "）—— 现在可以点「Zygisk 修复」");
                             shizukuRootButton.setText("✅ Shizuku 已启动（root）");
                             shizukuRootButton.setEnabled(true);
                             refreshStatus(false);
                         });
                         return;
                     }
+                    if (i == 1 || i == 6) {
+                        final String p = pid;
+                        final boolean b = binder;
+                        ui(() -> append("等待中… server=" + (p.isEmpty() ? "无" : p)
+                                + ", binder=" + b));
+                    }
                 }
-                runOnUiThread(() -> {
-                    append("✗ Shizuku 20s 内未上线（server 可能启动失败，"
-                            + "可在 Shizuku App 内查看日志）");
-                    shizukuRootButton.setEnabled(true);
-                    shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
+
+                /* 5) 失败分支给出可执行的下一步，而不是笼统一句「失败」。 */
+                String tail = suOutput("tail -25 '" + logPath + "' 2>/dev/null");
+                final String p = pid;
+                final boolean b = binder;
+                final String diag = tail.isEmpty() ? "(starter 日志为空)" : tail.replace('\n', ' ');
+                ui(() -> {
+                    append("✗ 未闭环: server=" + (p.isEmpty() ? "无进程" : p)
+                            + ", binder=" + b);
+                    append("starter 日志: " + diag);
+                    if (!p.isEmpty()) {
+                        append("→ server 已起但本 App 未绑定：退出重进 GhostRoot，"
+                                + "或在 Shizuku App 里给 GhostRoot 授权一次");
+                    } else {
+                        append("→ server 未存活：检查 KernelSU 是否允许 GhostRoot 的 su 会话创建后台进程");
+                    }
+                    resetShizukuRootButton();
                 });
             } catch (Exception e) {
-                runOnUiThread(() -> {
-                    append("启动 Shizuku 失败: " + e);
-                    shizukuRootButton.setEnabled(true);
-                    shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
+                ui(() -> {
+                    append("启动 Shizuku 异常: " + e);
+                    resetShizukuRootButton();
                 });
             }
-        });
+        }, "start-shizuku-root");
+        t.setDaemon(true);
         t.start();
+    }
+
+    private void ui(Runnable r) {
+        runOnUiThread(r);
+    }
+
+    private void resetShizukuRootButton() {
+        shizukuRootButton.setEnabled(true);
+        shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
+    }
+
+    /** 同步执行一条 su 命令并合并 stdout/stderr；带 12s 超时，绝不永久阻塞。 */
+    private static String suOutput(String cmd) {
+        final StringBuilder sb = new StringBuilder();
+        try {
+            ProcessBuilder pb = new ProcessBuilder("su", "-c", cmd);
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            final java.io.InputStream in = p.getInputStream();
+            Thread reader = new Thread(() -> {
+                byte[] buf = new byte[2048];
+                int n;
+                try {
+                    while ((n = in.read(buf)) > 0) {
+                        sb.append(new String(buf, 0, n, java.nio.charset.StandardCharsets.UTF_8));
+                    }
+                } catch (Exception ignored) {
+                }
+            }, "su-output");
+            reader.setDaemon(true);
+            reader.start();
+            if (!p.waitFor(12, java.util.concurrent.TimeUnit.SECONDS)) {
+                p.destroyForcibly();
+            }
+            reader.join(600);
+        } catch (Exception e) {
+            return "ERR:" + e;
+        }
+        return sb.toString().trim();
     }
 
     private void onRebootClicked() {
