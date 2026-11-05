@@ -62,9 +62,10 @@ REPAIR_SETTLE="${REPAIR_SETTLE:-5}"             # 留痕出现后等终态稳定
 SOFTREBOOT_WAIT="${SOFTREBOOT_WAIT:-120}"      # 框架软重启后等新 zygote 出现的上限(秒)
 REPAIR_VERIFY_TIMEOUT="${REPAIR_VERIFY_TIMEOUT:-90}"  # 终态（ZN/工行/闩锁）验证轮询上限(秒)
 SESSION_WAIT="${SESSION_WAIT:-90}"             # 等提权会话写出最终 verdict 的上限(秒)
-# v58: App 端 znRepair 同 boot 软重启 20min 冷却（.gr_zn_softreboot mtime）+
-# 25s 余量；冷却期内触发被 App 链路吞掉（zero 留痕），复查必须等它过期
-ZN_COOLDOWN_MARGIN="${ZN_COOLDOWN_MARGIN:-1225}"
+# v60: App 端 znRepair 同 boot 软重启冷却 20min → 2min（.gr_zn_softreboot
+# mtime）+ 25s 余量；冷却期内触发被 App 链路吞掉（zero 留痕），复查必须等
+# 它过期。20min 旧值实证 2026-11-05 13:32 三次触发全灭、白等 20 分钟。
+ZN_COOLDOWN_MARGIN="${ZN_COOLDOWN_MARGIN:-145}"
 RECHECK_ATTEMPTS="${RECHECK_ATTEMPTS:-4}"      # 冷却感知复查引擎的最多尝试次数
 
 LOG_DIR="${HOME}/.cache/gr_autoloop"

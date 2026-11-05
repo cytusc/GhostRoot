@@ -95,8 +95,14 @@ public class RootUserService extends IRootRunner.Stub {
     private static final String ZN_MODDIR = "/data/adb/modules/zygisksu";
     private static final String ZN_BIN = ZN_MODDIR + "/bin/zygiskd";
     private static final String ZN_SOFTREBOOT_MARK = "/data/local/tmp/.gr_zn_softreboot";
-    /** 同一 boot 内软重启只做一次：20 分钟内重复请求视为"上次没救活"，不再打扰用户。 */
-    private static final int ZN_SOFTREBOOT_COOLDOWN_MIN = 20;
+    /** v60: 同一 boot 内软重启冷却 20min → 2min。20min 是 v58 自毒循环修复
+     * 前的保守值（连点修复反复 stop/start 框架 = 软重启风暴，还会杀 Shizuku
+     * server 与守护进程）；v58 起清失败态已夹在 stop 之前一刻执行，
+     * post-fs-data 重跑时状态干净，注入成功后 zygotes>0 直接走 zn-ok 分支
+     * 不再进冷却。软重启本身 ~60s 完成，2min 足够框架稳定，同时仍挡住
+     * 连点。实证 2026-11-05 13:32：提权会话软重启后 20min 白等，三次修复
+     * 触发全被冷却吃掉（zero 留痕），设备明明只差一次软重启。 */
+    private static final int ZN_SOFTREBOOT_COOLDOWN_MIN = 2;
     private static final String ASSET_LIB = "libksud-fixed.so";
     private static final String ASSET_FIX = "fix.sh";
     /** v58: 框架软重启后复活 root app_process 守护类模块（SuToaster 等）。 */
@@ -250,6 +256,16 @@ public class RootUserService extends IRootRunner.Stub {
                      * —— 软重启杀了它们而 KernelSU 不会重跑模块启动脚本，
                      * 这正是模块属性里 "(❌Disabled)" 反复出现的根源 */
                     reviveModuleDaemons(callback);
+                    /* v61: 防复发自愈 —— module.prop 被清空/损坏会让 daemon
+                     * 静默退出、注入窗口错过（本次 zygisk 修复失灵的根因）。
+                     * 幂等：prop 空则从 orig 恢复；orig 缺失则从 prop 补。
+                     * 两者并存时 daemon 才能完成初始化并注入。 */
+                    rootShell("[ -s " + ZN_MODDIR + "/module.prop ] && cp " + ZN_MODDIR
+                            + "/module.prop " + ZN_MODDIR + "/module.prop.tmp1 || cp "
+                            + ZN_MODDIR + "/module.prop.orig " + ZN_MODDIR + "/module.prop; "
+                            + "rm -f " + ZN_MODDIR + "/module.prop.tmp1; "
+                            + "[ -f " + ZN_MODDIR + "/module.prop.orig ] || cp "
+                            + ZN_MODDIR + "/module.prop " + ZN_MODDIR + "/module.prop.orig", 10);
                     String r = zygiskAutoActivate(callback);
                     log(callback, "自愈链结论: " + r);
                     /* 手动语义兜底：幂等清除 dex2oat-flags（工行保活，
@@ -1245,14 +1261,17 @@ public class RootUserService extends IRootRunner.Stub {
             }
             writeLine(ZN_SOFTREBOOT_MARK, "ts=" + System.currentTimeMillis() / 1000
                     + " uptime=" + readUptime() + "s zygotes=" + zygotes + "\n", false);
-            /* v58 关键：软重启（KernelSU 模拟软重启，stop 时模块脚本
-             * emulated-soft-reboot.sh 会跑、start 后 post-fs-data 会重跑）
-             * 会在重启后重新拉起 daemon —— 但它启动时读到「失败态留痕」会
-             * 直接 abort 自杀（实测 11:34 周期：5954 读到 1 分钟前的失败态
-             * 后必杀，模块自毒循环）。所以清失败态必须夹在 stop 之前一刻
-             * 执行，而不是链路开头 —— 这样 post-fs-data 重跑时状态是干净的。 */
+            /* v61 关键修复：软重启从手搓 stop/start 改为 /data/adb/ksud soft-reboot。
+             * 根因链（2026-11-05 13:47-14:10 全链排查）：module.prop 损坏 →
+             * post-fs-data 的 daemon 读不到模块元数据静默退出 → 本 boot 注入
+             * 窗口错过；stop/start 又不保证 daemon 干净退出（zygiskd exit），
+             * 失败状态残留 → 之后所有 daemon 启动判 "Last injection failed"
+             * 写闩锁自杀（自毒死锁）。ksud soft-reboot 官方模拟重启会正确跑
+             * emulated-soft-reboot.sh（zygiskd exit 干净退出）并在 stop 前重跑
+             * post-fs-data → daemon 先于新 zygote 就位 → 注入成功（实测
+             * zygote_states:2 / preloaded 3/3 modules / modules_with_issue:0）。 */
             rootShell("setsid sh -c 'sleep 6; rm -f /data/adb/zygisksu/.abort_msg "
-                    + ZN_MODDIR + "/disable; stop; sleep 4; start' "
+                    + ZN_MODDIR + "/disable; /data/adb/ksud soft-reboot' "
                     + ">/dev/null 2>&1 </dev/null &", 8);
             // v49: 用户决策（保工行）—— 软重启后 vector zygisk 模块在新 zygote
             // 初始化时会重设 dex2oat-flags（工行闪退根因，POSTMORTEM 问题1），
