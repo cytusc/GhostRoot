@@ -398,6 +398,7 @@ public class GhostRootService extends Service {
              * 冒充修复结论），故跳过 pv 分支。 */
             verdict = code == 0 ? 0 : -1;
             detail = code == 0 ? "zn-repair=ok（自愈链结论与 status 见上方日志）"
+                    : code == 4 ? "zn-repair: Zygisk 未激活（结论见日志，建议软重启后复查）"
                     : code == 3 ? "zn-repair: root 未落地（su 不可用）—— 先提权再修复"
                     : code == 2 ? "zn-repair: 已有任务在执行中"
                     : "zn-repair failed exit=" + code;

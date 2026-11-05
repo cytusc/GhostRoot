@@ -285,6 +285,12 @@ public class RootUserService extends IRootRunner.Stub {
                             rootShell("sed -i 's/^zn=.*/zn=" + r + "/' " + VERDICT_FILE
                                     + " 2>/dev/null", 10);
                         }
+                    } else {
+                        /* v55: 链路跑完 ≠ 修好 —— 非成功结论显式失败（exit=4），
+                         * UI 不再显示「✅ 修复完成」；按钮状态依据留痕判定
+                         * 本来就不会误亮，这里补齐退出码与文案的一致性。 */
+                        log(callback, "⚠ Zygisk 未激活（结论 " + r + "）—— 本次修复按未完成处理");
+                        exit = 4;
                     }
                 }
             } catch (Throwable e) {
@@ -1183,18 +1189,29 @@ public class RootUserService extends IRootRunner.Stub {
             // soft-reboot 后无人接驾注入新 zygote（POSTMORTEM-20261104 问题5）。
             rootShell("rm -f /data/adb/zygisksu/.abort_msg " + ZN_MODDIR + "/disable", 10);
             ShellResult st = rootShell(ZN_BIN + " status 2>/dev/null", 20);
-            if (st.timedOut || !st.ok()) {
-                /* v49：daemon 可能已被闩锁/竞态杀掉 —— 先补一个单例再重读状态，
-                 * 仍失败才判 zn-absent（此前 status 失败直接放弃自愈是链路缺口） */
-                rootShell("cd " + ZN_MODDIR + " && setsid nohup ./bin/zygiskd daemon "
-                        + ">/dev/null 2>&1 </dev/null &", 10);
-                Thread.sleep(2000);
-                st = rootShell(ZN_BIN + " status 2>/dev/null", 20);
                 if (st.timedOut || !st.ok()) {
-                    /* 模块不存在 / 状态不可读 —— 不动系统 */
-                    return "zn-absent";
+                    /* v49：daemon 可能已被闩锁/竞态杀掉 —— 先补一个单例再重读状态 */
+                    rootShell("cd " + ZN_MODDIR + " && setsid nohup ./bin/zygiskd daemon "
+                            + ">/dev/null 2>&1 </dev/null &", 10);
+                    Thread.sleep(2000);
+                    st = rootShell(ZN_BIN + " status 2>/dev/null", 20);
+                    if (st.timedOut || !st.ok()) {
+                        /* v55: 补 daemon 后仍读不到 status —— 按「模块本体是否
+                         * 在位」分流：模块缺失 → 真 zn-absent 不动系统；模块
+                         * 在位而 status 不通 → daemon 已被 "Last injection
+                         * failed" 状态逼退（旧 zygote 注入必败，LKM 时序竞态
+                         * 的必然结果），zygotes 视为 0 继续走下方软重启调度，
+                         * 让 daemon 在新 zygote 上重试注入。v54 及之前直接
+                         * return "zn-absent" 放弃自愈 —— 即「App 显示修复
+                         * 成功但 Zygisk 实际未激活」的根因（实测 16:50）。 */
+                        ShellResult bin = rootShell(
+                                "ls " + ZN_BIN + " >/dev/null 2>&1 && echo yes || echo no", 5);
+                        if (!"yes".equals(bin.out == null ? "" : bin.out.trim())) {
+                            return "zn-absent";
+                        }
+                        log(callback, "zygisk: daemon 无响应但模块在位 —— 走软重启换新 zygote");
+                    }
                 }
-            }
             int zygotes = parseFieldInt(st.out, "zygote_states");
             int daemons = pidCount("zn-daemon");
             log(callback, "zygisk: zygote_states=" + zygotes + " zn-daemon=" + daemons);

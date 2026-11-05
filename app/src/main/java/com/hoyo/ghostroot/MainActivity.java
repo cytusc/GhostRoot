@@ -314,12 +314,16 @@ public class MainActivity extends Activity {
                 + " zn=" + zn + " repaired=" + (zn.startsWith("zn-ok")));
         boolean repaired = false;
         boolean repairNeedsRecheck = false;
+        /* v56: 「已调度」≠「已修复」—— zn-softreboot-scheduled 只是安排了
+         * 框架软重启等复查，Zygisk 实际未必激活（实测 17:25 boot：会话
+         * 调度后 daemon 仍未起，按钮却亮「已修复」误导用户）。单独状态
+         * 表达，按钮保持可点。 */
+        boolean repairScheduled = false;
         if (rootLanded) {
             if (zn.startsWith("zn-ok")) {
                 repaired = true;
             } else if (zn.contains("softreboot")) {
-                repaired = true;
-                repairNeedsRecheck = true;
+                repairScheduled = true;
             }
             String mk = readTmpFile(ZN_REPAIR_MARK);
             if (mk != null) {
@@ -342,9 +346,10 @@ public class MainActivity extends Activity {
                     }
                 }
                 if (freshThisBoot(ts)) {
-                    repaired = true;
-                    if (outcome.contains("softreboot")) {
-                        repairNeedsRecheck = true;
+                    if (outcome.startsWith("zn-ok")) {
+                        repaired = true;
+                    } else if (outcome.contains("softreboot")) {
+                        repairScheduled = true;
                     }
                 }
             }
@@ -364,6 +369,10 @@ public class MainActivity extends Activity {
             repairButton.setText(repairNeedsRecheck
                     ? "已修复（软重启后建议再点复查）"
                     : "✅ 已修复（本 boot）");
+        } else if (repairScheduled) {
+            /* v56: 已调度软重启但 Zygisk 未确认激活 —— 诚实状态，可点复查 */
+            repairButton.setEnabled(true);
+            repairButton.setText("修复已调度：待软重启后点我复查");
         } else {
             repairButton.setEnabled(true);
             repairButton.setText(rootLanded ? "Zygisk 修复（提权后点我）"
