@@ -94,7 +94,10 @@ public class MainActivity extends Activity {
     /** v46/v51: ADB 自动化触发 —— 验证调用方 uid 后延迟执行对应按钮动作。
      * 延迟是为了让 Shizuku binder listener 先完成一次状态刷新。
      * ADB_RUN → onRunClicked()；ADB_REPAIR → onRepairClicked()（幂等修复链，
-     * 不检查按钮禁用态，已显示「已修复」时仍可复查）。 */
+     * 不检查按钮禁用态，已显示「已修复」时仍可复查）。
+     * v57: 修复触发若撞上 Shizuku server 被软重启杀死的窗口，onRepairClicked
+     * 会进入 ≤20s 有界等待（自动化侧每轮触发前幂等重启 server），不再
+     * 静默放弃 —— 软重启后修复链自愈闭环的关键一环。 */
     private void maybeHandleAdbAction(Intent intent) {
         if (intent == null) {
             return;
@@ -505,7 +508,9 @@ public class MainActivity extends Activity {
                     }
                     runButton.setEnabled(true);
                     runButton.setText("开始执行");
-                    repairButton.setEnabled(true);
+                    /* v58: 不再无条件点亮修复按钮 —— 先落到「进行中」基态，
+                     * refreshButtonStates() 再按留痕/verdict 定成败禁点，
+                     * 消除 success 后的短暂可点窗口（误触来源） */
                     repairButton.setText("Zygisk 修复（提权后点我）");
                     /* v49: 按任务结果刷新持久状态 —— 成功时按钮变为
                      * 「已提权/已修复」并按需禁点，而非一律回到初始态 */
@@ -555,6 +560,18 @@ public class MainActivity extends Activity {
         startForegroundService(intent);
     }
 
+    /** v57: Shizuku server 有界等待 —— 提权会话的 late-load 自愈
+     * （zygiskAutoActivate）会安排一次框架软重启，stop/start 会杀死 adb
+     * 启动的 Shizuku server（POSTMORTEM-20261104 / commit 82e61d5）。
+     * 脚本侧自 v57 起每轮触发前幂等重启 server，server 就绪需要几秒；
+     * 此时 ADB_REPAIR intent 已送达本页，若直接放弃，本轮修复就在
+     * 手机端静默空转（2026-11-04 17:27/17:28 两次触发实测全灭）。
+     * 这里在主线程用 postDelayed 轮询（每 2s 一查、共 10 轮 = 20s）：
+     * binder 就绪即继续，超时如实报放弃并恢复按钮 —— 不吞修复请求。
+     * 用户决策 54 保留：仍为 Shizuku 单路径，等待 ≠ 代执行。 */
+    private static final int REPAIR_SHIZUKU_WAIT_ROUNDS = 10;   // 10 × 2s = 20s
+    private int repairShizukuWaitLeft = 0;
+
     /** v49: ZN 一键修复入口 —— 守卫与 onRunClicked 相同（Shizuku 就绪是
      * 硬前提：修复经 UserService 的 su 通道执行），区别只在 action 与按钮态。 */
     private void onRepairClicked() {
@@ -565,19 +582,104 @@ public class MainActivity extends Activity {
             append("已有任务在执行中，已为你重新接上日志");
             return;
         }
+        /* v58: 修复成功后的防误触——与「已提权」按钮 disabled 语义一致。
+         * 以前虽然 UI 会把按钮灰掉（refreshButtonStates），但点击入口与
+         * ADB_REPAIR am start 都不查持久状态，灰按钮照样能再跑一遍：
+         * 复跑本身幂等无害，但重放会重新走一遍 zygiskAutoActivate 的
+         * 清理/软重启调度，把不必要的状态扰动带回来。这里以「verdict
+         * zn= zn-ok* 或本 boot 新鲜留痕 outcome zn-ok*」为已修复真值，
+         * 命中直接拒绝并如实提示（读盘逻辑与 refreshButtonStates 一致）。 */
+        boolean alreadyRepaired = false;
+        boolean markZnOkFresh = false;
+        String vfZn = readTmpFile(VERDICT_PATH);
+        if (vfZn != null) {
+            long vfTs = 0;
+            for (String line : vfZn.split("\n")) {
+                int eq = line.indexOf('=');
+                if (eq < 0) {
+                    continue;
+                }
+                String k = line.substring(0, eq).trim();
+                String v = line.substring(eq + 1).trim();
+                if ("ts".equals(k)) {
+                    try {
+                        vfTs = Long.parseLong(v);
+                    } catch (NumberFormatException ignored) {
+                    }
+                } else if ("zn".equals(k) && v.startsWith("zn-ok")) {
+                    alreadyRepaired = freshThisBoot(vfTs);
+                }
+            }
+        }
+        if (!alreadyRepaired) {
+            String mk = readTmpFile(ZN_REPAIR_MARK);
+            if (mk != null) {
+                long mkTs = 0;
+                String mkOutcome = "";
+                for (String line : mk.split("\n")) {
+                    int eq = line.indexOf('=');
+                    if (eq < 0) {
+                        continue;
+                    }
+                    String k = line.substring(0, eq).trim();
+                    String v = line.substring(eq + 1).trim();
+                    if ("ts".equals(k)) {
+                        try {
+                            mkTs = Long.parseLong(v);
+                        } catch (NumberFormatException ignored) {
+                        }
+                    } else if ("outcome".equals(k)) {
+                        mkOutcome = v;
+                    }
+                }
+                if (mkOutcome.startsWith("zn-ok") && freshThisBoot(mkTs)) {
+                    alreadyRepaired = true;
+                    markZnOkFresh = true;
+                }
+            }
+        }
+        if (alreadyRepaired) {
+            repairButton.setEnabled(false);
+            repairButton.setText(markZnOkFresh ? "✅ 已修复（本 boot）" : "✅ 已修复");
+            append("✅ 修复已完成（本 boot 生效），已拦截本次重复触发；如需复查请整体重启后再看 Zygisk 状态");
+            return;
+        }
         /* v54: 回归 Shizuku 单路径（用户决策：更加保险）。v53 的 root 直连
          * 回退实测不可行：KSU 对未授权 App 在 mount ns 里 umount 了 su
          * （run-as stat ENOENT、无 avc），App 永远看不到 su 二进制，无法
          * 发起授权请求 —— 死锁；且 background 线程直调 append 会触发
          * CalledFromWrongThreadException。脚本侧 repair_via_root 不受影响。 */
         if (!shizukuInstalled()) {
+            repairShizukuWaitLeft = 0;
+            repairButton.setEnabled(true);
+            repairButton.setText("Zygisk 修复（提权后点我）");
             append("Shizuku 未安装，无法修复");
             return;
         }
         if (!Shizuku.pingBinder()) {
-            append("Shizuku 未运行：先打开 Shizuku 用无线调试启动，再回来点");
+            if (repairShizukuWaitLeft > 0) {
+                repairShizukuWaitLeft--;
+                if (repairShizukuWaitLeft == 0) {
+                    append("Shizuku 在等待窗口内未就绪，本次修复放弃（server 就绪后可再点重试）");
+                    repairButton.setEnabled(true);
+                    repairButton.setText("Zygisk 修复（提权后点我）");
+                    return;
+                }
+                append("  Shizuku 仍未运行，约 " + (repairShizukuWaitLeft * 2) + "s 后再查…");
+                repairButton.setText("等待 Shizuku… (" + (repairShizukuWaitLeft * 2) + "s)");
+                repairButton.postDelayed(this::onRepairClicked, 2000L);
+                return;
+            }
+            repairShizukuWaitLeft = REPAIR_SHIZUKU_WAIT_ROUNDS;
+            append("Shizuku 未运行，进入等待窗口（≤" + (REPAIR_SHIZUKU_WAIT_ROUNDS * 2)
+                    + "s）—— 自动化侧会在每轮触发前拉起 server…");
+            repairButton.setEnabled(false);
+            repairButton.setText("等待 Shizuku…");
+            getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            repairButton.postDelayed(this::onRepairClicked, 2000L);
             return;
         }
+        repairShizukuWaitLeft = 0;
         if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
             append("请求 Shizuku 授权…");
             try {

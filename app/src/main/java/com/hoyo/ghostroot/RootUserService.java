@@ -99,6 +99,10 @@ public class RootUserService extends IRootRunner.Stub {
     private static final int ZN_SOFTREBOOT_COOLDOWN_MIN = 20;
     private static final String ASSET_LIB = "libksud-fixed.so";
     private static final String ASSET_FIX = "fix.sh";
+    /** v58: 框架软重启后复活 root app_process 守护类模块（SuToaster 等）。 */
+    private static final String ASSET_REVIVE = "revive_module_daemons.sh";
+    private static final String REVIVE_DIR = "/data/adb/ghostroot";
+    private static final String REVIVE_PATH = REVIVE_DIR + "/revive_module_daemons.sh";
     private static final String FIXED_LIB_MD5 = "2c84145e3efb6f7f045fef3ed1eea4c6";
     /** v20: environment matched to adbd's own shell env (the context that
      * went 2/9 today) — replaces the earlier hand-written PATH order and
@@ -242,6 +246,10 @@ public class RootUserService extends IRootRunner.Stub {
                     exit = 3;
                 } else {
                     log(callback, "root 就绪（uid=0），进入自愈链…");
+                    /* v58: 修复入口先复活死掉的守护类模块进程（SuToaster 等）
+                     * —— 软重启杀了它们而 KernelSU 不会重跑模块启动脚本，
+                     * 这正是模块属性里 "(❌Disabled)" 反复出现的根源 */
+                    reviveModuleDaemons(callback);
                     String r = zygiskAutoActivate(callback);
                     log(callback, "自愈链结论: " + r);
                     /* 手动语义兜底：幂等清除 dex2oat-flags（工行保活，
@@ -1237,13 +1245,28 @@ public class RootUserService extends IRootRunner.Stub {
             }
             writeLine(ZN_SOFTREBOOT_MARK, "ts=" + System.currentTimeMillis() / 1000
                     + " uptime=" + readUptime() + "s zygotes=" + zygotes + "\n", false);
-            rootShell("setsid sh -c 'sleep 6; stop; sleep 4; start' "
+            /* v58 关键：软重启（KernelSU 模拟软重启，stop 时模块脚本
+             * emulated-soft-reboot.sh 会跑、start 后 post-fs-data 会重跑）
+             * 会在重启后重新拉起 daemon —— 但它启动时读到「失败态留痕」会
+             * 直接 abort 自杀（实测 11:34 周期：5954 读到 1 分钟前的失败态
+             * 后必杀，模块自毒循环）。所以清失败态必须夹在 stop 之前一刻
+             * 执行，而不是链路开头 —— 这样 post-fs-data 重跑时状态是干净的。 */
+            rootShell("setsid sh -c 'sleep 6; rm -f /data/adb/zygisksu/.abort_msg "
+                    + ZN_MODDIR + "/disable; stop; sleep 4; start' "
                     + ">/dev/null 2>&1 </dev/null &", 8);
             // v49: 用户决策（保工行）—— 软重启后 vector zygisk 模块在新 zygote
             // 初始化时会重设 dex2oat-flags（工行闪退根因，POSTMORTEM 问题1），
             // 延迟 ~120s 追加清除一次，盖住"prop 在会话结束后才被设置"的时序。
             rootShell("setsid sh -c 'sleep 120; /data/adb/ksu/bin/resetprop "
                     + "--delete dalvik.vm.dex2oat-flags' >/dev/null 2>&1 </dev/null &", 8);
+            // v58: 框架软重启（stop/start）会顺带杀死 root app_process 守护类
+            // 模块进程（实测 2026-11-05：SuToaster 在 10:53 软重启后被杀，
+            // module.prop 自写 "(❌Disabled)"）。KernelSU 的 boot-completed
+            // 模块脚本只在整机开机重跑，纯 stop/start 不触发 —— 守护无人复活。
+            // 修复链自己安排的软重启必须自己兜底：新框架起来后（+45s）
+            // 检查并复活（运行各模块自带的 boot-completed.sh，等价开机）。
+            rootShell("setsid sh -c 'sleep 45; /system/bin/sh /data/adb/ghostroot/revive_module_daemons.sh'"
+                    + " >/dev/null 2>&1 </dev/null &", 8);
             log(callback, "zygisk: zygote NOT hooked (late-load race) -> framework soft reboot "
                     + "scheduled; ZN will catch the fresh zygote (~40s)");
             return "zn-softreboot-scheduled";
@@ -1260,6 +1283,46 @@ public class RootUserService extends IRootRunner.Stub {
         rootShell("/data/adb/ksu/bin/resetprop --delete "
                 + "dalvik.vm.dex2oat-flags 2>/dev/null", 10);
         log(callback, "zygisk: dex2oat-flags cleared (" + tag + ") —— ICBC 保活策略");
+    }
+
+    /** v58: root app_process 守护类模块进程的复活逻辑。
+     * 背景见 zygiskAutoActivate 内注释：框架软重启杀 SuToaster，而
+     * KernelSU 的 boot-completed 模块脚本只在整机开机重跑 —— 纯
+     * stop/start 后这些 daemon 无人接手，模块自写 "(❌Disabled)"
+     * 描述（实测 2026-11-05 11:28 手动跑 boot-completed.sh 后恢复）。
+     * 动作：只做「进程不在 → 运行该模块自带的 boot-completed.sh」
+     * —— 脚本是模块作者自己写的启动逻辑，fetch 权限域不变：
+     * 每个脚本都先 self-check（进程在就退出），幂等可反复执行。
+     * 修复链里在两处调用：znRepair 入口（吃掉非软重启来源的死亡）
+     * 和软重启调度后的 +45s 延迟任务（吃掉软重启本身的死亡）。 */
+    private void reviveModuleDaemons(ILogCallback callback) {
+        File local = new File(TMP, "revive_module_daemons.sh");
+        boolean localOk = false;
+        try {
+            localOk = copyAsset(ASSET_REVIVE, local);
+        } catch (Exception e) {
+            log(callback, "模块守护: 资产拷贝失败 " + e);
+        }
+        if (!localOk || !local.isFile()) {
+            log(callback, "模块守护: 复活脚本暂不可用（asset 缺失），下次修复再试");
+            return;
+        }
+        /* 部署到 /data/adb/ghostroot 后执行 —— 延迟任务（软重启 +45s）引用
+         * 的是部署路径，所以入口先保证它在场 */
+        rootShell("mkdir -p " + REVIVE_DIR
+                + " && cp " + local.getAbsolutePath() + " " + REVIVE_PATH
+                + " && chmod 700 " + REVIVE_PATH, 10);
+        ShellResult r = rootShell(REVIVE_PATH + " 2>/dev/null", 30);
+        if (r.ok() && r.out != null && !r.out.trim().isEmpty()) {
+            for (String line : r.out.split("\n")) {
+                String l = line.trim();
+                if (!l.isEmpty()) {
+                    log(callback, "模块守护: " + l);
+                }
+            }
+        } else if (!r.ok()) {
+            log(callback, "模块守护: 复活脚本异常（rc/超时），下次修复再试");
+        }
     }
 
     /** v41: pidof 计数（0=未运行）。zn-daemon 是 zygiskd 的进程名 —— 按
