@@ -30,14 +30,14 @@ public class RootUserService extends IRootRunner.Stub {
     /** rounds per Shizuku session (one boot) — mirrors PC autoroot's cycle loop.
      * v45: 每轮都是独立 lottery 前提是"堆还干净"——fire 链一旦 LANDED（.fired
      * 匹配本 boot），循环立即终止，绝不二次开火（06:59 事故根因）。
-     * v70: 方案 1 条件式 2 轮安全重试机制。
-     * CVE-2026-43499 原理证实：当上一轮为纯净 Write 1 failed（exit==1 且 enforce==1）时，
-     * 内核堆未发生脏写入，允许冷却 10s 后进行第二轮抽奖，大幅提升单 boot 命中率；
-     * 非安全退出（exit!=1 或 enforce 异常）则触发熔断直接终止。
-     * 设为 2 轮完美匹配 autoloop 90s 超时窗口（2轮总耗时约 65s）。 */
-    private static final int MAX_ROUNDS = 2;
-    /** PC rhythm: 10s cooldown between cycles. */
-    private static final long ROUND_COOLDOWN_SECONDS = 10;
+     * v71: 离线 boot 深度分析与历史实测归因结论 ——
+     * CVE-2026-43499 的 futex-PI 竞态与 Slab 预备无论成功与否，均会不可逆地破坏当 boot
+     * 的 rt_mutex / kmalloc-128 堆拓扑。同 boot 第二次开火（Round 2）必然在
+     * rt_mutex_slowlock 自旋锁处引发内核 CPU 死锁（死机/冻屏/硬件看门狗超时咬死）。
+     * 坚决执行单 boot 单发铁律（MAX_ROUNDS=1），未中优雅判负并由 autoloop 进行 ~35s 冷重启。 */
+    private static final int MAX_ROUNDS = 1;
+    /** PC rhythm: ~20s cooldown between cycles. */
+    private static final long ROUND_COOLDOWN_SECONDS = 20;
     /** v45: fire.sh v7 的落地标记 —— LANDED 后写本 boot 的 boot_id。
      * 同 boot 值匹配 = 该内核已被成功攻击过，再攻即 known wedge scenario。 */
     private static final String FIRED_PATH = "/data/local/tmp/.fired";
@@ -535,7 +535,7 @@ public class RootUserService extends IRootRunner.Stub {
                 uptime = readUptime();
             }
             int settle = Math.min(settleSeconds, 0);
-            log(callback, "uptime=" + uptime + "s: targeting optimal window (up to " + MAX_ROUNDS + " rounds conditional retry)");
+            log(callback, "uptime=" + uptime + "s: targeting optimal window (single-shot)");
             if (settle > 0) {
                 Thread.sleep(settle * 1000L);
             }

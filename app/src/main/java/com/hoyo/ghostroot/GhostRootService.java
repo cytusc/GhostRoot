@@ -200,8 +200,9 @@ public class GhostRootService extends Service {
                  * v67: Vector 寄生启动补充 LAUNCH_MANAGER Category 修正错误报告弹窗，bump 38→39。
                  * v68: 移除所有激进守护与强杀逻辑，还原原生 service.sh，bump 39→40。
                  * v69: 提权成功率调优：严格单 boot 单发、黄金 32s 窗口零额外等待、消灭 fsync 抖动，bump 40→41。
-                 * v70: 方案 1 条件式 2 轮安全重试：仅上一轮纯净 safe exit (exit==1, enforce==1) 允许 10s 冷却后二次开火，单例 fire watcher 清理，bump 41→42。 */
-                .version(42);
+                 * v70: 方案 1 条件式 2 轮安全重试：仅上一轮纯净 safe exit (exit==1, enforce==1) 允许 10s 冷却后二次开火，单例 fire watcher 清理，bump 41→42。
+                 * v71: 离线 boot 深度分析定位：死机源于同 boot 二次开火引发的 rt_mutex_slowlock 自旋死锁，回归单 boot 单发物理铁律，bump 42→43。 */
+                .version(43);
     }
 
     @Override
