@@ -303,6 +303,12 @@ public class MainActivity extends Activity {
     private void refreshButtonStates() {
         boolean rootLanded = false;
         String zn = "";
+        /* v64: verdict 的 uapi/net 字段 —— uapiGuard 换装（uapi2-to-5）后
+         * sepolicy.rule 本 boot 注入失败（ksud 开机注入被 uapi 不匹配挡住），
+         * vector/LSPosed 在 Enforcing 下缺规则会报"selinux 异常/未激活"，
+         * 软重启救不了 sepolicy，只有整机重启才能恢复。UI 据此如实提示。 */
+        String uapi = "";
+        String net = "";
         String vf = readTmpFile(VERDICT_PATH);
         if (vf != null) {
             long ts = 0;
@@ -326,21 +332,28 @@ public class MainActivity extends Activity {
                     }
                 } else if ("zn".equals(k)) {
                     zn = v;
+                } else if ("uapi".equals(k)) {
+                    uapi = v;
+                } else if ("net".equals(k)) {
+                    net = v;
                 }
             }
             rootLanded = verdict == 0 && freshThisBoot(ts);
         }
+        boolean sepolicyPending = rootLanded
+                && ("uapi2-to-5".equals(uapi) || net.contains("reboot-pending"));
         /* v49: 判定过程留痕 —— 按钮状态判定链任何一环（读文件/时钟/解析）
          * 失败都会静默回到初始按钮态，logcat 是唯一可观测点 */
         android.util.Log.i("GR_UI", "refresh: vf=" + (vf == null ? "null" : vf.length() + "B")
                 + " uptime=" + readUptimeSeconds() + "s rootLanded=" + rootLanded
                 + " zn=" + zn + " repaired=" + (zn.startsWith("zn-ok")));
         boolean repaired = false;
-        boolean repairNeedsRecheck = false;
         /* v56: 「已调度」≠「已修复」—— zn-softreboot-scheduled 只是安排了
          * 框架软重启等复查，Zygisk 实际未必激活（实测 17:25 boot：会话
          * 调度后 daemon 仍未起，按钮却亮「已修复」误导用户）。单独状态
-         * 表达，按钮保持可点。 */
+         * 表达，按钮保持可点。
+         * v64: 原 repairNeedsRecheck 死变量已删（从未被置 true），「已修复」
+         * 按钮恒可点，见下分支注释。 */
         boolean repairScheduled = false;
         if (rootLanded) {
             if (zn.startsWith("zn-ok")) {
@@ -388,10 +401,17 @@ public class MainActivity extends Activity {
             runButton.setText("开始执行");
         }
         if (repaired) {
-            repairButton.setEnabled(repairNeedsRecheck);
-            repairButton.setText(repairNeedsRecheck
-                    ? "已修复（软重启后建议再点复查）"
-                    : "✅ 已修复（本 boot）");
+            /* v64: 「已修复」不再禁点 —— freshThisBoot 用内核 uptime 判
+             * "本 boot"，框架软重启（stop/start、ksud soft-reboot）不清
+             * uptime，zn-ok 留痕会跨软重启"保鲜"；但软重启后 zygote 重生，
+             * Zygisk/vector 可能已重新失效，灰死按钮让用户无法再触发修复
+             * （2026-11-06 实测复现）。改诚实可点态：留痕照展示，允许随时
+             * 复查（修复链幂等，已 hook 时 zn-ok 直接收尾，不重复软重启）。
+             * sepolicyPending 时额外提示：vector 的 selinux 异常需整机重启。 */
+            repairButton.setEnabled(true);
+            repairButton.setText(sepolicyPending
+                    ? "✅ 已修复（sepolicy 待整机重启，vector 可能仍异常）"
+                    : "✅ 已修复（本 boot）— 可再点复查");
         } else if (repairScheduled) {
             /* v56: 已调度软重启但 Zygisk 未确认激活 —— 诚实状态，可点复查 */
             repairButton.setEnabled(true);
@@ -593,7 +613,13 @@ public class MainActivity extends Activity {
     private int repairShizukuWaitLeft = 0;
 
     /** v49: ZN 一键修复入口 —— 守卫与 onRunClicked 相同（Shizuku 就绪是
-     * 硬前提：修复经 UserService 的 su 通道执行），区别只在 action 与按钮态。 */
+     * 硬前提：修复经 UserService 的 su 通道执行），区别只在 action 与按钮态。
+     * v64: v58 的「已修复防误触」硬拦截废除 —— 留痕 ts 用内核 uptime 判
+     * "本 boot"，框架软重启不清 uptime，软重启后 zygote 重生、留痕可能
+     * 已过期（vector/toast 重新失效），此时点修复却被门禁吞掉、按钮还
+     * 被 refreshButtonStates 灰死，用户无法再触发修复（2026-11-06 实测
+     * 复现）。复查重跑本身安全：修复链幂等，zygote 已 hook 时
+     * zygiskAutoActivate 直接 zn-ok 收尾，不会重复调度软重启。 */
     private void onRepairClicked() {
         if (GhostRootService.running) {
             GhostRootService.attach(activitySink);
@@ -608,7 +634,8 @@ public class MainActivity extends Activity {
          * 复跑本身幂等无害，但重放会重新走一遍 zygiskAutoActivate 的
          * 清理/软重启调度，把不必要的状态扰动带回来。这里以「verdict
          * zn= zn-ok* 或本 boot 新鲜留痕 outcome zn-ok*」为已修复真值，
-         * 命中直接拒绝并如实提示（读盘逻辑与 refreshButtonStates 一致）。 */
+         * v64 起命中仅作日志提示、不再拒绝（软重启后留痕可能已过期，
+         * 硬拦截会把用户需要的复查一并吞掉）。 */
         boolean alreadyRepaired = false;
         boolean markZnOkFresh = false;
         String vfZn = readTmpFile(VERDICT_PATH);
@@ -659,10 +686,10 @@ public class MainActivity extends Activity {
             }
         }
         if (alreadyRepaired) {
-            repairButton.setEnabled(false);
-            repairButton.setText(markZnOkFresh ? "✅ 已修复（本 boot）" : "✅ 已修复");
-            append("✅ 修复已完成（本 boot 生效），已拦截本次重复触发；如需复查请整体重启后再看 Zygisk 状态");
-            return;
+            /* v64: 不再 return/禁点 —— 留痕可能在框架软重启后已过期
+             * （zygote 重生，Zygisk/vector 重新失效），如实提示后放行复查 */
+            append("ℹ 本 boot 已有修复留痕（" + (markZnOkFresh ? "znRepair 成功" : "会话 zn-ok")
+                    + "）—— 允许复查重跑：软重启后 zygote 重生，留痕可能已过期");
         }
         /* v54: 回归 Shizuku 单路径（用户决策：更加保险）。v53 的 root 直连
          * 回退实测不可行：KSU 对未授权 App 在 mount ns 里 umount 了 su

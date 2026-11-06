@@ -29,4 +29,29 @@ else
     fi
 fi
 
+# --- ksuGrantToast watchdog（v64 新增）---
+# 看门狗守护循环（service.d 脚本 detach 出来的 --daemon）与 SuToaster 一样
+# 会被框架软重启杀死，且 service.d 不随软重启重跑 —— watchdog 死后
+# SuToaster 再自发死亡（原生拿不到 sulog fd 直接退出，watchdog 日志实测
+# 2026-11-05 22:12 后无任何恢复记录）就无人接手，模块 description 停在 ❌。
+# service.d 脚本自带 pidfile 单实例守卫，重复拉起安全。
+if pgrep -f 'ksuGrantToast-watchdog' >/dev/null 2>&1; then
+    echo "ksuGrantToast: watchdog alive"
+else
+    if [ -f /data/adb/service.d/99-ksuGrantToast-watchdog.sh ]; then
+        echo "ksuGrantToast: watchdog dead -> relaunch service.d script"
+        setsid sh /data/adb/service.d/99-ksuGrantToast-watchdog.sh \
+          >/dev/null 2>&1 </dev/null &
+        REVIVED=1
+        sleep 2
+        if pgrep -f 'ksuGrantToast-watchdog' >/dev/null 2>&1; then
+            echo "ksuGrantToast: watchdog relaunched"
+        else
+            echo "ksuGrantToast: watchdog relaunch failed"
+        fi
+    else
+        echo "ksuGrantToast: watchdog script missing, skip"
+    fi
+fi
+
 echo "revived=$REVIVED"
