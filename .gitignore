@@ -9,6 +9,7 @@ local.properties
 *.iml
 .DS_Store
 .workbuddy/
+.workbuddy-ai/
 
 # 构建产物（可由源码复现）
 *.apk

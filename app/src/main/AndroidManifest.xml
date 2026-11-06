@@ -26,6 +26,10 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="com.hoyo.ghostroot.action.ADB_OPEN_VECTOR" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
 
         <!-- v22: exported so the phone babysitter (adb/PC) can burn the fuse

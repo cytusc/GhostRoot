@@ -195,8 +195,11 @@ public class GhostRootService extends Service {
                 /* v49: AIDL 新增 znRepair —— 版本必须 bump 让 Shizuku 停掉
                  * 旧接口的 UserService 进程，否则 binder 调 znRepair 会
                  * NoSuchMethod。v65: RootUserService 改动（软重启前清场
-                 * vectord，Vector #878 根治），红线 bump 36→37。 */
-                .version(37);
+                 * vectord，Vector #878 根治），红线 bump 36→37。
+                 * v66: Vector 守护增强与寄生直达，bump 37→38。
+                 * v67: Vector 寄生启动补充 LAUNCH_MANAGER Category 修正错误报告弹窗，bump 38→39。
+                 * v68: 移除所有激进守护与强杀逻辑，还原原生 service.sh，bump 39→40。 */
+                .version(40);
     }
 
     @Override

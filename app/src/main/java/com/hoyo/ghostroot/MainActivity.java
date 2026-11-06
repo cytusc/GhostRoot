@@ -43,6 +43,7 @@ public class MainActivity extends Activity {
     private static final String ACTION_ADB_RUN = "com.hoyo.ghostroot.action.ADB_RUN";
     private static final String ACTION_ADB_REPAIR = "com.hoyo.ghostroot.action.ADB_REPAIR";
     private static final String ACTION_ADB_START_SHIZUKU = "com.hoyo.ghostroot.action.ADB_START_SHIZUKU";
+    private static final String ACTION_ADB_OPEN_VECTOR = "com.hoyo.ghostroot.action.ADB_OPEN_VECTOR";
 
     private TextView logView;
     private Button runButton;
@@ -53,6 +54,10 @@ public class MainActivity extends Activity {
      * 不依赖 PC / 无线调试；启动完即可点「Zygisk 修复」。 */
     private Button shizukuRootButton;
     private static final String BTN_SHIZUKU_ROOT = "启动 Shizuku（root，提权后点我）";
+    /** v66: 打开 Vector 管理器 —— 针对 Vector 寄生架构在 Enforcing 下
+     * 点桌面独立图标报"未激活"的问题，以 root 调起 com.android.shell 寄生端。 */
+    private Button openVectorButton;
+    private static final String BTN_OPEN_VECTOR = "打开 Vector 管理器（root 直达）";
     /** v26: sink 做成字段，onResume 自动重挂 —— Activity 被销毁重建后
      * 也能继续收到日志与结束回调（服务端有缓冲回放）。 */
     private GhostRootService.Sink activitySink;
@@ -113,7 +118,8 @@ public class MainActivity extends Activity {
         final boolean run = ACTION_ADB_RUN.equals(action);
         final boolean repair = ACTION_ADB_REPAIR.equals(action);
         final boolean startShizuku = ACTION_ADB_START_SHIZUKU.equals(action);
-        if (!run && !repair && !startShizuku) {
+        final boolean openVector = ACTION_ADB_OPEN_VECTOR.equals(action);
+        if (!run && !repair && !startShizuku && !openVector) {
             return;
         }
         int uid = android.os.Binder.getCallingUid();
@@ -123,7 +129,7 @@ public class MainActivity extends Activity {
             append("收到 " + action + " 但调用方 uid=" + uid + " 不在白名单，忽略");
             return;
         }
-        append("ADB 触发 " + (run ? "执行" : repair ? "ZN 修复" : "root 启动 Shizuku")
+        append("ADB 触发 " + (run ? "执行" : repair ? "ZN 修复" : startShizuku ? "root 启动 Shizuku" : "打开 Vector")
                 + "（caller uid=" + uid + "），1.5s 后开始…");
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         runButton.postDelayed(() -> {
@@ -132,8 +138,10 @@ public class MainActivity extends Activity {
                     onRunClicked();
                 } else if (repair) {
                     onRepairClicked();
-                } else {
+                } else if (startShizuku) {
                     onStartShizukuRootClicked();
+                } else {
+                    onOpenVectorClicked();
                 }
             }
         }, 1500L);
@@ -217,6 +225,15 @@ public class MainActivity extends Activity {
         shizukuRootButton.setEnabled(true);
         shizukuRootButton.setOnClickListener(v -> onStartShizukuRootClicked());
         root.addView(shizukuRootButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        /* v66: 打开 Vector 管理器（root 直达） —— 针对 Vector 寄生架构直接点桌面图标
+         * 报未激活的问题，直接以 shell 身份调起寄生端 Activity，100% 激活可用。 */
+        openVectorButton = new Button(this);
+        openVectorButton.setText(BTN_OPEN_VECTOR);
+        openVectorButton.setEnabled(true);
+        openVectorButton.setOnClickListener(v -> onOpenVectorClicked());
+        root.addView(openVectorButton, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         rebootButton = new Button(this);
@@ -906,6 +923,77 @@ public class MainActivity extends Activity {
     private void resetShizukuRootButton() {
         shizukuRootButton.setEnabled(true);
         shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
+    }
+
+    /** v66: 打开 Vector 管理器 —— 针对 Vector 寄生架构在 Enforcing 下
+     * 点桌面独立图标报"未激活"的问题，以 root 调起 com.android.shell 寄生端，
+     * 并回读 cli status 展示真实框架状态。 */
+    private void onOpenVectorClicked() {
+        openVectorButton.setEnabled(false);
+        append("正在检测 Vector 状态并调起管理器…");
+        Thread t = new Thread(() -> {
+            try {
+                // 1. root 探测
+                String id = suOutput("id");
+                if (!id.contains("uid=0")) {
+                    ui(() -> {
+                        append("✗ root 未就绪：请先「开始执行」提权，或在 KernelSU 给 GhostRoot 授权 su");
+                        openVectorButton.setEnabled(true);
+                    });
+                    return;
+                }
+
+                // 2. 检测模块目录
+                String chk = suOutput("[ -d /data/adb/modules/zygisk_vector ] && echo OK || echo MISSING");
+                if (!chk.contains("OK")) {
+                    ui(() -> {
+                        append("✗ 未检测到 Vector 模块（/data/adb/modules/zygisk_vector 不存在）");
+                        openVectorButton.setEnabled(true);
+                    });
+                    return;
+                }
+
+                // 3. 回读 cli status 校验真实运行状态
+                String status = suOutput("sh /data/adb/modules/zygisk_vector/cli status 2>/dev/null");
+                StringBuilder sbCli = new StringBuilder();
+                if (!status.isEmpty()) {
+                    for (String line : status.split("\n")) {
+                        String tl = line.trim();
+                        if (tl.startsWith("Framework Version:") || tl.startsWith("Enabled Modules:")) {
+                            sbCli.append(tl).append(" | ");
+                        }
+                    }
+                }
+                final String cliSummary = sbCli.toString();
+
+                // 4. 以 root 调起寄生端 Activity (必须携带 Category: org.matrix.vector.manager.LAUNCH_MANAGER)
+                // 若无该 Category，系统会弹原生 Bugreport 弹窗（"错误报告警告"）；
+                // 携带该 Category 时，Vector 的 ParasiticHooker 才会将其拦截并替换为 Vector Manager 界面。
+                // 优先使用模块自带 action.sh（官方标准），不存在则用带 Category 的 am start。
+                String launch = suOutput("[ -f /data/adb/modules/zygisk_vector/action.sh ] "
+                        + "&& sh /data/adb/modules/zygisk_vector/action.sh 2>&1 "
+                        + "|| am start -a android.intent.action.MAIN -c org.matrix.vector.manager.LAUNCH_MANAGER -n com.android.shell/.BugreportWarningActivity 2>&1");
+                ui(() -> {
+                    if (!cliSummary.isEmpty()) {
+                        append("ℹ Vector 框架底层: " + cliSummary);
+                    }
+                    if (launch.contains("Starting: Intent")) {
+                        append("✅ 已调起 Vector 寄生管理器（通过 com.android.shell 激活）\n"
+                                + "提示: Vector 为系统寄生架构，请通过本按钮或通知栏打开；直接点击桌面独立 Manager 图标会报未激活。");
+                    } else {
+                        append("调起结果: " + launch.replace('\n', ' '));
+                    }
+                    openVectorButton.setEnabled(true);
+                });
+            } catch (Exception e) {
+                ui(() -> {
+                    append("唤起 Vector 异常: " + e);
+                    openVectorButton.setEnabled(true);
+                });
+            }
+        }, "open-vector-mgr");
+        t.setDaemon(true);
+        t.start();
     }
 
     /** 同步执行一条 su 命令并合并 stdout/stderr；带 12s 超时，绝不永久阻塞。 */
