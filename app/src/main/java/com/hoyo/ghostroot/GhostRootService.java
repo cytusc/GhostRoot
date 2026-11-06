@@ -198,8 +198,10 @@ public class GhostRootService extends Service {
                  * vectord，Vector #878 根治），红线 bump 36→37。
                  * v66: Vector 守护增强与寄生直达，bump 37→38。
                  * v67: Vector 寄生启动补充 LAUNCH_MANAGER Category 修正错误报告弹窗，bump 38→39。
-                 * v68: 移除所有激进守护与强杀逻辑，还原原生 service.sh，bump 39→40。 */
-                .version(40);
+                 * v68: 移除所有激进守护与强杀逻辑，还原原生 service.sh，bump 39→40。
+                 * v69: 提权成功率调优：严格单 boot 单发、黄金 32s 窗口零额外等待、消灭 fsync 抖动，bump 40→41。
+                 * v70: 方案 1 条件式 2 轮安全重试：仅上一轮纯净 safe exit (exit==1, enforce==1) 允许 10s 冷却后二次开火，单例 fire watcher 清理，bump 41→42。 */
+                .version(42);
     }
 
     @Override
@@ -369,7 +371,8 @@ public class GhostRootService extends Service {
     private void startRun() {
         emit("执行中（清后台 + 静置 + exploit）…");
         try {
-            runner.run("/data/local/tmp/ghostlock", "/data/local/tmp/profile.bin", 15, callback);
+            // v69: settleSeconds 设为 0，使开火精准卡位 uptime 31s~32s，不再追加等待
+            runner.run("/data/local/tmp/ghostlock", "/data/local/tmp/profile.bin", 0, callback);
         } catch (RemoteException e) {
             emit("run failed: " + e);
             running = false;

