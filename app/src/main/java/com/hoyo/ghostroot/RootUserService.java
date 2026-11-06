@@ -1270,6 +1270,20 @@ public class RootUserService extends IRootRunner.Stub {
              * emulated-soft-reboot.sh（zygiskd exit 干净退出）并在 stop 前重跑
              * post-fs-data → daemon 先于新 zygote 就位 → 注入成功（实测
              * zygote_states:2 / preloaded 3/3 modules / modules_with_issue:0）。 */
+            /* v65: Vector #878 多 daemon 撞车根治 —— KSU commit #3291（2026-03-22）
+             * 把软重启改成完整 soft_reboot() 重放 post-fs-data + service.d + 模块
+             * service.sh；vectord 是 detached 进程 stop 杀不掉，重放又起一个新副本
+             * → 多 daemon 争抢同一 rendezvous service（proxy=serial_vector）互相
+             * 转发事务，其中一个栈溢出崩溃 → 无框架注入，Vector 管理器显示未激活
+             * （2026-11-06 本机实测：3 个 vectord 副本，最新 daemon 日志
+             * "No Vector module reached system_server"）。上游 workaround 是
+             * "避免 ksud soft-reboot" 或 "disable→软重启→enable→再软重启"；
+             * 这里等价实现为：调度软重启前清掉全部现存 vectord，让重放的
+             * service.sh 只起一个干净 daemon，省两次重启。'[v]ectord' 字符类
+             * 防 pgrep/pkill 自匹配（命令行含明文 vectord 会把自己杀掉，
+             * 2026-11-06 两次踩坑）。 */
+            rootShell("kill $(pgrep -f '[v]ectord') 2>/dev/null; sleep 1; "
+                    + "echo vectord_left=$(pgrep -f '[v]ectord' 2>/dev/null | wc -l)", 10);
             rootShell("setsid sh -c 'sleep 6; rm -f /data/adb/zygisksu/.abort_msg "
                     + ZN_MODDIR + "/disable; /data/adb/ksud soft-reboot' "
                     + ">/dev/null 2>&1 </dev/null &", 8);

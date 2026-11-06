@@ -194,8 +194,9 @@ public class GhostRootService extends Service {
                 .debuggable(false)
                 /* v49: AIDL 新增 znRepair —— 版本必须 bump 让 Shizuku 停掉
                  * 旧接口的 UserService 进程，否则 binder 调 znRepair 会
-                 * NoSuchMethod。 */
-                .version(36);
+                 * NoSuchMethod。v65: RootUserService 改动（软重启前清场
+                 * vectord，Vector #878 根治），红线 bump 36→37。 */
+                .version(37);
     }
 
     @Override
