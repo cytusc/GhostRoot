@@ -16,3 +16,7 @@ local.properties
 
 # 大体积二进制备份（模块/安装包，不入库）
 backups/modules-20261103/
+
+# 设备现场归档（内核 dmesg 快照：单份 ~4MB，含设备内核地址等环境信息）
+# 仅保留在 scripts/device-artifacts/ 本地，不入库
+scripts/device-artifacts/*.log

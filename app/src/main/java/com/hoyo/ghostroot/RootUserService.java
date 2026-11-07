@@ -135,6 +135,8 @@ public class RootUserService extends IRootRunner.Stub {
     private Thread kmsgFollowerThread;
     private java.lang.Process kmsgFollowerProcess;
     private volatile boolean kmsgFollowerStop;
+    /* v69-diag(2): root dmesg 通道的句柄组 —— 字段语义与 kmsgFollower 同构 */
+    private java.lang.Process dmesgFollowerProcess;
     /* v26: verdict accumulator — set by every exit path, flushed to
      * VERDICT_FILE exactly once in finally(). MIN_VALUE = "not set yet". */
     private int lastVerdict = Integer.MIN_VALUE;
@@ -467,6 +469,12 @@ public class RootUserService extends IRootRunner.Stub {
                         : "foreign-exploit-live-skip-attack";
                 if (verified) {
                     exit = 0;
+                    /* v70: 本 boot root 已活、不打 exploit 的会话同样要先
+                     * 续上 dmesg 跟随器 —— 设备长期停在已提权态时，这是
+                     * 唯一会自动重建内核日志通道的入口（命中 boot 的
+                     * verifyLanded 只跑一次；进程被杀/Server 重启后靠这里
+                     * 收拾孤儿）。幂等：同 JVM 已有活写者则直接跳过。 */
+                    startDmesgFollower(callback);
                     lastMagica = runMagicaFix(callback);
                     /* v33: 管理器提示必须在补丁检查之后，且按结果分流 ——
                      * 不能在检查前就说"直接打开管理器"。 */
@@ -750,6 +758,15 @@ public class RootUserService extends IRootRunner.Stub {
                 + (rootVerified ? "uid=0 ✓ VERIFIED" : "NOT verified -> " + lastSu));
         String magica = "";
         if (rootVerified) {
+            /* v70 (2026-11-07): root 一活就先钉住 dmesg 落盘通道 —— 放在
+             * 整个收尾链最前（早于 pstore 快照）。本 ROM 三条取证通道的
+             * 当日实证：pstore 每次 boot 被 vendor 消费/清空、logcat
+             * -b kernel 对 shell 全天零输出、lockup 型冻结不产生 oops；
+             * 唯一活通道就是 root dmesg -w 的「全量历史缓冲 + 逐行
+             * fsync」。异步启动几乎不耗时，越早接住内核输出越好；
+             * follower 不随会话收尾回收，覆盖命中后 ~20min 的延迟冻结
+             * 窗口（10:45 那次复现）。 */
+            startDmesgFollower(callback);
             /* v69-diag (移植自实验分支 v76 9027fef): 收尾链重排序 ——
              * attemptPstoreSample 提到最前。理由：本日 2026-11-07 两次
              * "落地→收尾窗口复位"（09:02 / 09:08 命中后 boot_id 变化）把
@@ -1045,11 +1062,130 @@ public class RootUserService extends IRootRunner.Stub {
 
     /** v39: 打开（或滚动后重开）kmsg 日志文件，写开始标记并强推落盘。 */
     private java.io.FileOutputStream openKmsgOut(String path) throws java.io.IOException {
+        return openKmsgOut(path, "kmsg follower");
+    }
+
+    /** v70: 带通道 tag 的重载 —— dmesg 日志不能沿用 "kmsg follower"
+     * 的 start 标记，否则归因时两条通道的启动行无法区分（历史上就是用
+     * `grep -v "kmsg follower start"` 过滤空转 kmsg 日志的）。 */
+    private java.io.FileOutputStream openKmsgOut(String path, String tag)
+            throws java.io.IOException {
         java.io.FileOutputStream out = new java.io.FileOutputStream(path, true);
-        out.write(("=== kmsg follower start ts=" + System.currentTimeMillis() / 1000
+        out.write(("=== " + tag + " start ts=" + System.currentTimeMillis() / 1000
                 + " uptime=" + readUptime() + "s ===\n").getBytes());
         out.getFD().sync();
         return out;
+    }
+
+    /** v69-diag(2) (2026-11-07): root dmesg 落盘跟随器 —— 本 ROM 归因的
+     * 唯一活内核日志通道。当日实证三连：logcat -b kernel 对 shell/power
+     * uid 全天零输出（kmsgFollower 空转一整天，只有 start 行没有内容）；
+     * /sys/fs/pstore 在每次 boot 被 vendor 消费/清空（"[PSTORE] readable
+     * and EMPTY…"全命中），且 lockup 型冻结不产生 oops、pstore 本就为空；
+     * 冻结瞬间任何在线读取都不可能 —— 所以唯一路径就是“存量 dmesg
+     * 缓冲 + 逐行 fsync 落盘”，冻结瞬间写入停止，已落盘内容跨重启保留。
+     *
+     * 语义与 kmsgFollower 同构：rotation、per-line fsync、no-data 显式
+     * 上报。差异只有三点 —— ① 数据源是 `su -c dmesg -w`（缓冲区先吐
+     * 全量历史再 follow，因此开跟随即包含本 boot 全部 W1/W1b/PI route
+     * 内核侧痕迹）；② 只在 root 验证通过后调用 —— 2026-11-07 11:37
+     * 手动重启后的干净 boot 实测：未提权时 shell(uid 2000) 跑 dmesg
+     * 直接 "klogctl: Permission denied"（dmesg_restrict=0 也无效，是
+     * SELinux 拦 klogctl），而 root 活着的 boot 上同一命令可读可
+     * follow。所以「攻击前就起跟随器」在这台 ROM 上不成立，两个调用
+     * 点绝不能上移；③ 不在 finally 里回收 —— 故意让它跨会话
+     * 存活直至下一次 reboot（钉住 post-land 延迟冻结窗口，如 10:45 那次
+     * 命中 ~20min 后的 UI 冻结）。重复调用幂等：同 JVM 存活则跳过；
+     * 跨 JVM 孤儿用 root pkill 收掉再起新写者。 */
+    private void startDmesgFollower(ILogCallback callback) {
+        final String DMESG_LOG = "/data/local/tmp/ghostroot-dmesg.log";
+        final long MAX_BYTES = 32L * 1024 * 1024;
+        try {
+            /* 同 JVM 已有活写者 → 幂等跳过（跨会话持续写是设计语义） */
+            java.lang.Process old = dmesgFollowerProcess;
+            if (old != null && old.isAlive()) {
+                log(callback, "dmesg follower already running — keeping the single writer");
+                return;
+            }
+            /* 跨 JVM 孤儿（Shizuku server 重启后句柄丢失）：root pkill
+             * 收旧再起新，保证同一时刻只有一个写者把 append 文件写穿。
+             * v70: 必须按进程名精确匹配 -x，不能用 -f —— -f 会匹配完整
+             * 命令行，承载 pkill 的 su/sh 自身命令行就含 "dmesg -w" 字面
+             * 串，等于自杀：rootShell 拿不到返回、超时 10s，后续启动还会
+             * 被误判成失败。实测本 ROM Toybox 0.8.12 pkill 支持 -x。 */
+            rootShell("pkill -x dmesg 2>/dev/null; true", 10);
+            File f = new File(DMESG_LOG);
+            if (f.length() >= MAX_BYTES) {
+                File rot = new File(DMESG_LOG + ".1");
+                rot.delete();
+                log(callback, "dmesg log rotated: " + f.length() + " bytes -> "
+                        + rot.getName());
+                f.renameTo(rot);
+            }
+            dmesgFollowerProcess = new java.lang.ProcessBuilder(
+                    "su", "-c", SH_ENV + " dmesg -w").start();
+            final java.lang.Process proc = dmesgFollowerProcess;
+            final AtomicBoolean firstData = new AtomicBoolean(false);
+            Thread t = new Thread(() -> {
+                try (java.io.BufferedReader in = new java.io.BufferedReader(
+                        new InputStreamReader(proc.getInputStream()))) {
+                    java.io.FileOutputStream out = openKmsgOut(DMESG_LOG, "dmesg follower");
+                    try {
+                        String ln;
+                        while ((ln = in.readLine()) != null) {
+                            if (out.getChannel().size() >= MAX_BYTES) {
+                                out.close();
+                                File rot = new File(DMESG_LOG + ".1");
+                                rot.delete();
+                                new File(DMESG_LOG).renameTo(rot);
+                                out = openKmsgOut(DMESG_LOG, "dmesg follower");
+                            }
+                            if (firstData.compareAndSet(false, true)) {
+                                log(callback, "dmesg follower confirmed: first kernel line received "
+                                        + "(boot history up to now included)");
+                            }
+                            out.write((ln + "\n").getBytes());
+                            out.getFD().sync();   /* per-line fsync — 整个方案的意义所在 */
+                        }
+                    } finally {
+                        try {
+                            out.close();
+                        } catch (Exception ignored) {
+                        }
+                    }
+                } catch (Throwable e) {
+                    try {
+                        log(callback, "dmesg follower ended: " + e);
+                    } catch (Exception ignored) {
+                    }
+                }
+            }, "dmesg-follower");
+            t.setDaemon(true);
+            t.start();
+            log(callback, "dmesg follower launching (root su -c dmesg -w) -> " + DMESG_LOG);
+            /* v70: 启动自检 —— 3s 内没收到首行必须显式告警。不能只靠采集
+             * 线程 finally 里的 no-data 上报：dmesg -w 正常会一直阻塞不返回，
+             * 「通道死了但进程还挂着」时 finally 永远不会执行，正是
+             * kmsgFollower 空转一整天、日志里只有 start 行却无人察觉的
+             * 同款盲点。宁可多花 3s，不能再白等一天。 */
+            for (int i = 0; i < 6 && !firstData.get(); i++) {
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            if (!firstData.get()) {
+                log(callback, "dmesg follower WARNING: no kernel line in 3s "
+                        + "(su grant / dmesg -w / SELinux? channel may be dead)");
+            }
+        } catch (Throwable e) {
+            try {
+                log(callback, "dmesg follower start FAILED: " + e);
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     /** v39: 回收 kmsg 采集器 —— 置停止标志并 destroy logcat 子进程让
