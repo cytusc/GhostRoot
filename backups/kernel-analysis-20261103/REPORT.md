@@ -30,7 +30,10 @@ OTA 即本机内核的权威参照物。
 - 共同符号 3594，CRC 一致仅 1555、不一致 2039（如 module_layout: 0x5ec51e3c vs 0x222dd63）
 - 两套 `struct module` 均为 960 → 待设备侧确认运行内核加载哪套（/proc/modules 对目录）
 
-## 二、产物（backups/kernel-analysis-20261103/，已 git 入库）
+## 二、产物（backups/kernel-analysis-20261103/；大文件本地保留、不入库）
+> 2026-11-07：`kernel.elf` / `kernel.Image` / `vendor_dlkm-ko-*.tar.gz` 三个
+> 可由 OTA 复现的大文件（合计约 152MB）已从 git 索引移除，**本地文件原样保留**；
+> 忽略规则见根目录 `.gitignore`，复现命令见下方第四节。其余小文件仍入库。
 - `kernel.Image`（48MB，arm64 原始内核，来自 OTA boot 分区）
 - `kernel.elf`（vmlinux-to-elf 重建，191,910 符号，kallsyms 查询/符号存在性分析用）
 - `stock-crc-db.json`（621 ko 的 __versions CRC 库，按目录分 top/gki）

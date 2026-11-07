@@ -20,3 +20,19 @@ backups/modules-20261103/
 # 设备现场归档（内核 dmesg 快照：单份 ~4MB，含设备内核地址等环境信息）
 # 仅保留在 scripts/device-artifacts/ 本地，不入库
 scripts/device-artifacts/*.log
+*.log
+
+# 一次性内核分析产物：可由 OTA + payload-dumper-go 复现（复现命令见
+# backups/kernel-analysis-20261103/REPORT.md）。本地保留，只从索引移除。
+# REPORT.md / stock-crc-db.json / stock-btf.json 仍入库（分析结论与 CRC 库）。
+backups/kernel-analysis-20261103/*.elf
+backups/kernel-analysis-20261103/*.Image
+backups/kernel-analysis-20261103/*.img
+backups/kernel-analysis-20261103/*.tar.gz
+
+# 签名密钥与 Android 转储（预防性；当前仓库无密钥文件，release 走 debug key）
+*.jks
+*.keystore
+*.p12
+*.hprof
+captures/
