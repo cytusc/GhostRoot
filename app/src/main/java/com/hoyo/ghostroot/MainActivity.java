@@ -23,8 +23,8 @@ import rikka.shizuku.Shizuku;
 
 /**
  * 纯手动模式：
- * - 打开 App 只检测 Shizuku 是否安装 / 正在运行 / 已授权，不做任何自动执行
- * - 只有点击「开始执行」按钮才会启动 GhostRootService 提权
+ * - 打开 App 启动前台服务待命，并检查 Shizuku 状态
+ * - 只有点击「开始执行」按钮才会提权
  */
 public class MainActivity extends Activity {
 
@@ -84,6 +84,13 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(buildUi());
+        startForegroundService(new Intent(this, GhostRootService.class)
+                .setAction(GhostRootService.ACTION_START));
+        if (android.os.Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1002);
+        }
 
         Shizuku.addBinderReceivedListener(binderReceived);
         Shizuku.addBinderDeadListener(binderDead);
@@ -91,7 +98,7 @@ public class MainActivity extends Activity {
 
         append("GhostRoot v" + BuildConfig.VERSION_NAME + " (build " + BuildConfig.VERSION_CODE + ") 就绪");
         append("目标: " + CLI_PATH + " + " + PROFILE_PATH);
-        append("模式: 纯手动 —— 打开本应用只检查 Shizuku 状态，点击按钮才开始执行");
+        append("模式: 前台服务常驻，点击按钮才执行；可在通知中停止服务");
         refreshStatus(true);
         maybeHandleAdbAction(getIntent());
     }
@@ -228,7 +235,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         /* v66: 打开 Vector 管理器（root 直达） —— 针对 Vector 寄生架构直接点桌面图标
-         * 报未激活的问题，直接以 shell 身份调起寄生端 Activity，100% 激活可用。 */
+         * 报未激活的问题，通过 Shizuku 的 shell 通道调起寄生端 Activity。 */
         openVectorButton = new Button(this);
         openVectorButton.setText(BTN_OPEN_VECTOR);
         openVectorButton.setEnabled(true);
@@ -240,6 +247,15 @@ public class MainActivity extends Activity {
         rebootButton.setText("重启手机（快速重试下一轮）");
         rebootButton.setOnClickListener(v -> onRebootClicked());
         root.addView(rebootButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        Button stopServiceButton = new Button(this);
+        stopServiceButton.setText("停止前台服务并退出");
+        stopServiceButton.setOnClickListener(v -> {
+            stopService(new Intent(this, GhostRootService.class));
+            finishAndRemoveTask();
+        });
+        root.addView(stopServiceButton, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         logView = new TextView(this);
@@ -789,6 +805,8 @@ public class MainActivity extends Activity {
         }
         final String binFromApi = ai.nativeLibraryDir + "/libshizuku.so";
         final String logPath = "/data/local/tmp/gr_shizuku_root.log";
+        startForegroundService(new Intent(this, GhostRootService.class)
+                .setAction(GhostRootService.ACTION_START));
         shizukuRootButton.setEnabled(false);
         shizukuRootButton.setText("启动中…");
         final Thread t = new Thread(() -> {
@@ -925,75 +943,80 @@ public class MainActivity extends Activity {
         shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
     }
 
-    /** v66: 打开 Vector 管理器 —— 针对 Vector 寄生架构在 Enforcing 下
-     * 点桌面独立图标报"未激活"的问题，以 root 调起 com.android.shell 寄生端，
-     * 并回读 cli status 展示真实框架状态。 */
+    private Shizuku.UserServiceArgs vectorServiceArgs;
+    private android.content.ServiceConnection vectorConnection;
+    private final Runnable vectorBindTimeout = () -> {
+        append("连接 Shizuku Vector 通道超时，请确认 Shizuku 正在运行且已授权");
+        releaseVectorService();
+    };
+
     private void onOpenVectorClicked() {
-        openVectorButton.setEnabled(false);
-        append("正在检测 Vector 状态并调起管理器…");
-        Thread t = new Thread(() -> {
-            try {
-                // 1. root 探测
-                String id = suOutput("id");
-                if (!id.contains("uid=0")) {
-                    ui(() -> {
-                        append("✗ root 未就绪：请先「开始执行」提权，或在 KernelSU 给 GhostRoot 授权 su");
-                        openVectorButton.setEnabled(true);
-                    });
-                    return;
-                }
-
-                // 2. 检测模块目录
-                String chk = suOutput("[ -d /data/adb/modules/zygisk_vector ] && echo OK || echo MISSING");
-                if (!chk.contains("OK")) {
-                    ui(() -> {
-                        append("✗ 未检测到 Vector 模块（/data/adb/modules/zygisk_vector 不存在）");
-                        openVectorButton.setEnabled(true);
-                    });
-                    return;
-                }
-
-                // 3. 回读 cli status 校验真实运行状态
-                String status = suOutput("sh /data/adb/modules/zygisk_vector/cli status 2>/dev/null");
-                StringBuilder sbCli = new StringBuilder();
-                if (!status.isEmpty()) {
-                    for (String line : status.split("\n")) {
-                        String tl = line.trim();
-                        if (tl.startsWith("Framework Version:") || tl.startsWith("Enabled Modules:")) {
-                            sbCli.append(tl).append(" | ");
-                        }
-                    }
-                }
-                final String cliSummary = sbCli.toString();
-
-                // 4. 以 root 调起寄生端 Activity (必须携带 Category: org.matrix.vector.manager.LAUNCH_MANAGER)
-                // 若无该 Category，系统会弹原生 Bugreport 弹窗（"错误报告警告"）；
-                // 携带该 Category 时，Vector 的 ParasiticHooker 才会将其拦截并替换为 Vector Manager 界面。
-                // 优先使用模块自带 action.sh（官方标准），不存在则用带 Category 的 am start。
-                String launch = suOutput("[ -f /data/adb/modules/zygisk_vector/action.sh ] "
-                        + "&& sh /data/adb/modules/zygisk_vector/action.sh 2>&1 "
-                        + "|| am start -a android.intent.action.MAIN -c org.matrix.vector.manager.LAUNCH_MANAGER -n com.android.shell/.BugreportWarningActivity 2>&1");
-                ui(() -> {
-                    if (!cliSummary.isEmpty()) {
-                        append("ℹ Vector 框架底层: " + cliSummary);
-                    }
-                    if (launch.contains("Starting: Intent")) {
-                        append("✅ 已调起 Vector 寄生管理器（通过 com.android.shell 激活）\n"
-                                + "提示: Vector 为系统寄生架构，请通过本按钮或通知栏打开；直接点击桌面独立 Manager 图标会报未激活。");
-                    } else {
-                        append("调起结果: " + launch.replace('\n', ' '));
-                    }
-                    openVectorButton.setEnabled(true);
-                });
-            } catch (Exception e) {
-                ui(() -> {
-                    append("唤起 Vector 异常: " + e);
-                    openVectorButton.setEnabled(true);
-                });
+        if (vectorConnection != null) return;
+        if (!Shizuku.pingBinder()) {
+            append("Shizuku 未运行，请先启动 Shizuku，再打开 Vector 管理器");
+            return;
+        }
+        try {
+            if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                append("请授予 Shizuku 权限后，再点「打开 Vector 管理器」");
+                Shizuku.requestPermission(REQ_PERMISSION);
+                return;
             }
-        }, "open-vector-mgr");
-        t.setDaemon(true);
-        t.start();
+            openVectorButton.setEnabled(false);
+            startForegroundService(new Intent(this, GhostRootService.class)
+                    .setAction(GhostRootService.ACTION_START));
+            append("通过 Shizuku 检测 Vector 状态并调起管理器…");
+            // 独立 tag 避免解绑 Vector 时停止正在提权或修复的 UserService。
+            vectorServiceArgs = new Shizuku.UserServiceArgs(
+                    new android.content.ComponentName(this, RootUserService.class))
+                    .tag("vector-manager").processNameSuffix("vector")
+                    .daemon(false).debuggable(false).version(42);
+            vectorConnection = new android.content.ServiceConnection() {
+                @Override
+                public void onServiceConnected(android.content.ComponentName name, android.os.IBinder binder) {
+                    openVectorButton.removeCallbacks(vectorBindTimeout);
+                    Thread worker = new Thread(() -> {
+                        String result;
+                        try {
+                            result = IRootRunner.Stub.asInterface(binder).openVectorManager();
+                        } catch (Exception e) {
+                            result = "唤起 Vector 异常: " + e;
+                        }
+                        final String message = result;
+                        ui(() -> {
+                            if (!isDestroyed()) append(message);
+                            releaseVectorService();
+                        });
+                    }, "open-vector-mgr");
+                    worker.setDaemon(true);
+                    worker.start();
+                }
+
+                @Override
+                public void onServiceDisconnected(android.content.ComponentName name) {
+                    append("Shizuku Vector 通道已断开，可重新点击尝试");
+                    releaseVectorService();
+                }
+            };
+            openVectorButton.postDelayed(vectorBindTimeout, 15_000L);
+            Shizuku.bindUserService(vectorServiceArgs, vectorConnection);
+        } catch (Exception e) {
+            append("连接 Shizuku Vector 通道失败: " + e);
+            releaseVectorService();
+        }
+    }
+
+    private void releaseVectorService() {
+        openVectorButton.removeCallbacks(vectorBindTimeout);
+        if (vectorConnection != null) {
+            try {
+                Shizuku.unbindUserService(vectorServiceArgs, vectorConnection, true);
+            } catch (Exception e) {
+                if (!isDestroyed()) append("释放 Vector 通道失败: " + e);
+            }
+            vectorConnection = null;
+        }
+        openVectorButton.setEnabled(true);
     }
 
     /** 同步执行一条 su 命令并合并 stdout/stderr；带 12s 超时，绝不永久阻塞。 */
@@ -1051,6 +1074,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        releaseVectorService();
         Shizuku.removeBinderReceivedListener(binderReceived);
         Shizuku.removeBinderDeadListener(binderDead);
         Shizuku.removeRequestPermissionResultListener(permissionListener);

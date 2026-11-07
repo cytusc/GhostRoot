@@ -10,8 +10,9 @@ android {
         applicationId = "com.hoyo.ghostroot"
         minSdk = 26
         targetSdk = 34
-        versionCode = 72
-        versionName = "2.56"
+        versionCode = 73
+        versionName = "2.57"
+        testInstrumentationRunner = "com.hoyo.ghostroot.VectorSmokeTest"
     }
 
     buildTypes {

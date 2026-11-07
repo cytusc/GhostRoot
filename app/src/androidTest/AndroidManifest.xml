@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <instrumentation
+        android:name="com.hoyo.ghostroot.ForegroundServiceSmokeTest"
+        android:targetPackage="com.hoyo.ghostroot" />
+</manifest>

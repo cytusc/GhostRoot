@@ -21,10 +21,12 @@ import rikka.shizuku.Shizuku;
  * - 不会开机自启，不会监听 Shizuku 自动触发
  * - 只有 MainActivity 的「开始执行」按钮（或通知上的手动按钮）以 ACTION_RUN 启动它时，
  *   它才绑定 Shizuku UserService 并执行提权
- * - 执行期间通过前台服务保活，日志同时推送给 Activity（sink）和通知栏
+ * - 打开应用后保持前台服务，任务结束后待命，用户手动停止才退出
  */
 public class GhostRootService extends Service {
 
+    public static final String ACTION_START = "START";
+    public static final String ACTION_STOP = "STOP";
     public static final String ACTION_RUN = "RUN";
     public static final String ACTION_REBOOT = "REBOOT";
     /** v49: ZN 一键修复 —— 提权成功后手机端手动触发，不依赖 PC。 */
@@ -187,6 +189,12 @@ public class GhostRootService extends Service {
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel(CHANNEL, "GhostRoot",
                 NotificationManager.IMPORTANCE_LOW));
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIF_ID, notify("前台服务运行中，等待手动操作"),
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+        } else {
+            startForeground(NOTIF_ID, notify("前台服务运行中，等待手动操作"));
+        }
         serviceArgs = new Shizuku.UserServiceArgs(
                 new ComponentName(this, RootUserService.class.getName()))
                 .daemon(false)
@@ -198,41 +206,44 @@ public class GhostRootService extends Service {
                  * vectord，Vector #878 根治），红线 bump 36→37。
                  * v66: Vector 守护增强与寄生直达，bump 37→38。
                  * v67: Vector 寄生启动补充 LAUNCH_MANAGER Category 修正错误报告弹窗，bump 38→39。
-                 * v68: 移除所有激进守护与强杀逻辑，还原原生 service.sh，bump 39→40。 */
-                .version(40);
+                 * v68: 移除所有激进守护与强杀逻辑，还原原生 service.sh，bump 39→40。
+                 * 新增 Vector 管理器 AIDL 方法，bump 40→41。
+                 * 软重启不再提前杀 Vector，模块恢复交给看门狗，bump 41→42。 */
+                .version(42);
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // 必须先进入前台状态（Android 14 要求）
-        startForeground(NOTIF_ID, notify("手动模式：等待开始指令"),
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-        if (intent != null && ACTION_RUN.equals(intent.getAction())) {
-            main.post(this::beginRun);
-        } else if (intent != null && ACTION_REBOOT.equals(intent.getAction())) {
-            main.post(this::beginReboot);
-        } else if (intent != null && ACTION_ZN_REPAIR.equals(intent.getAction())) {
-            main.post(this::beginRepair);
-        } else {
-            // 没有明确的手动指令 → 不执行任何东西，直接退出
-            emit("未收到手动执行指令，服务退出");
-            stopForeground(STOP_FOREGROUND_REMOVE);
+        if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+            emit("用户停止前台服务");
             stopSelf();
+            return START_NOT_STICKY;
         }
-        return START_NOT_STICKY;
+        if (intent != null && ACTION_RUN.equals(intent.getAction())) {
+            beginRun();
+        } else if (intent != null && ACTION_REBOOT.equals(intent.getAction())) {
+            beginReboot();
+        } else if (intent != null && ACTION_ZN_REPAIR.equals(intent.getAction())) {
+            beginRepair();
+        }
+        // 系统恢复服务时只恢复待命通知，不重放提权或修复任务。
+        return START_STICKY;
     }
 
     @Override
     public void onDestroy() {
-        /* v39: 前台服务销毁时解除 Shizuku UserService 绑定 —— 此前旧
-         * connection 跨实例泄漏、长期占住已完成的 UserService 进程。
-         * 用 stop=false：任务中途被系统回收时绝不主动杀掉正在执行的
-         * UserService；残余进程由下一次 beginRun 的 unbind(stop=true)
-         * 统一回收。 */
+        main.removeCallbacksAndMessages(null);
+        if (running) {
+            finish(-3);
+        }
+        finished = true;
+        // 前台宿主退出时一起停止 UserService，避免留下无前台宿主的工作进程。
         try {
-            Shizuku.unbindUserService(serviceArgs, connection, false);
+            Shizuku.unbindUserService(serviceArgs, connection, true);
         } catch (Throwable ignored) {
         }
+        runner = null;
+        stopForeground(STOP_FOREGROUND_REMOVE);
         super.onDestroy();
     }
 
@@ -241,11 +252,6 @@ public class GhostRootService extends Service {
         if (running) {
             /* v26: 之前是静默 return —— 通知栏按钮/重复启动会看起来"没反应" */
             emit("已有任务在执行中，忽略本次启动");
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            stopSelf();
-            return;
-        }
-        if (finished) {
             return;
         }
         if (!Shizuku.pingBinder()) {
@@ -260,6 +266,9 @@ public class GhostRootService extends Service {
         }
         running = true;
         finished = false;
+        repairMode = false;
+        pendingRepair = false;
+        pendingReboot = false;
         /* v32: 新任务开始即作废旧缓冲与上一任务的结束结论 —— 否则页面
          * 重连 attach() 会把上一次的"成功/失败"回放给正在运行的新任务。 */
         synchronized (BUF) {
@@ -293,11 +302,6 @@ public class GhostRootService extends Service {
     private void beginRepair() {
         if (running) {
             emit("已有任务在执行中，忽略本次修复");
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            stopSelf();
-            return;
-        }
-        if (finished) {
             return;
         }
         if (!Shizuku.pingBinder()) {
@@ -313,6 +317,7 @@ public class GhostRootService extends Service {
         running = true;
         finished = false;
         repairMode = true;
+        pendingReboot = false;
         /* v49.1: 必须置位 pendingRepair —— connection.onServiceConnected
          * 按 pendingReboot/pendingRepair/提权 三分支分发，此标志漏置会让
          * 修复请求 fall-through 到 prepareSession+startRun()，把修复按钮
@@ -342,6 +347,10 @@ public class GhostRootService extends Service {
 
     /** 手动触发的重启入口（失败后快速进入下一轮干净堆）。 */
     private void beginReboot() {
+        if (running) {
+            emit("已有任务在执行中，忽略本次重启");
+            return;
+        }
         if (runner != null) {
             emit("正在重启手机…");
             try {
@@ -353,8 +362,6 @@ public class GhostRootService extends Service {
         }
         if (!Shizuku.pingBinder()) {
             emit("Shizuku 未运行，无法远程重启，请手动重启手机");
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            stopSelf();
             return;
         }
         pendingReboot = true;
@@ -461,7 +468,7 @@ public class GhostRootService extends Service {
         lastDoneDetail = detail;
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.notify(SUMMARY_ID, notify(verdict == 0 ? "✅ " + verdictText + "：" + detail
-                : (verdict == 1 ? "❓ " + verdictText + "：" + detail : "❌ " + verdictText + "：" + detail)));
+                : (verdict == 1 ? "❓ " + verdictText + "：" + detail : "❌ " + verdictText + "：" + detail), false));
         Sink s = sink;
         /* v49.1: running 必须先于 onDone 清零 —— onDone 在主线程内联执行时
          * 会调 refreshButtonStates()，其 running 守卫若还挂着就提前 return，
@@ -479,8 +486,7 @@ public class GhostRootService extends Service {
              * 页面，页面重开时仍会回放一次，这是预期行为。） */
             lastDoneConsumed = true;
         }
-        stopForeground(STOP_FOREGROUND_REMOVE);
-        stopSelf();
+        update("任务已结束，前台服务待命");
     }
 
     /** v26: .gr_verdict 解析（ts/verdict/su/enforce/ksu/exit/magica/vr_disarmed/reason）。 */
@@ -554,8 +560,7 @@ public class GhostRootService extends Service {
             } catch (Throwable ignored) {
             }
         }
-        stopForeground(STOP_FOREGROUND_REMOVE);
-        stopSelf();
+        update("任务已中止，前台服务待命");
     }
 
     /** 完整日志给 Activity，关键行给通知。v23: 同时镜像到 logcat ——
@@ -621,20 +626,27 @@ public class GhostRootService extends Service {
     }
 
     private Notification notify(String text) {
+        return notify(text, true);
+    }
+
+    private Notification notify(String text, boolean ongoing) {
         PendingIntent pi = PendingIntent.getActivity(this, 0,
                 new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
         Intent run = new Intent(this, GhostRootService.class).setAction(ACTION_RUN);
-        PendingIntent runPi = PendingIntent.getService(this, 1, run, PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent runPi = PendingIntent.getForegroundService(this, 1, run, PendingIntent.FLAG_IMMUTABLE);
         Intent reboot = new Intent(this, GhostRootService.class).setAction(ACTION_REBOOT);
-        PendingIntent rebootPi = PendingIntent.getService(this, 2, reboot, PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent rebootPi = PendingIntent.getForegroundService(this, 2, reboot, PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent stopPi = PendingIntent.getForegroundService(this, 3,
+                new Intent(this, GhostRootService.class).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE);
         return new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_dialog_alert)
                 .setContentTitle("GhostRoot")
                 .setContentText(text)
-                .setOngoing(true)
+                .setOngoing(ongoing)
                 .setContentIntent(pi)
                 .addAction(new Notification.Action.Builder(null, "开始执行", runPi).build())
                 .addAction(new Notification.Action.Builder(null, "重启手机", rebootPi).build())
+                .addAction(new Notification.Action.Builder(null, "停止服务", stopPi).build())
                 .build();
     }
 

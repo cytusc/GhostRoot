@@ -192,6 +192,39 @@ public class RootUserService extends IRootRunner.Stub {
         return Process.myUid() == Process.SHELL_UID;
     }
 
+    @Override
+    public String openVectorManager() {
+        ShellResult who = rootShell("id -u", 12);
+        if (!who.ok() || !"0".equals(who.out.trim())) {
+            return "✗ Shizuku 通道无法取得 root（exit=" + who.exit
+                    + ", timeout=" + who.timedOut + "）: " + who.out.trim();
+        }
+        ShellResult module = rootShell("test -d /data/adb/modules/zygisk_vector", 12);
+        if (!module.ok()) {
+            return "✗ 无法访问 Vector 模块（exit=" + module.exit
+                    + ", timeout=" + module.timedOut + "）: " + module.out.trim();
+        }
+        ShellResult status = rootShell("sh /data/adb/modules/zygisk_vector/cli status", 20);
+        StringBuilder result = new StringBuilder();
+        if (status.ok()) {
+            result.append("Vector 状态: ").append(status.out.trim()).append('\n');
+        } else {
+            result.append("⚠ Vector 状态读取失败（exit=").append(status.exit)
+                    .append(", timeout=").append(status.timedOut).append("）: ")
+                    .append(status.out.trim()).append('\n');
+        }
+        ShellResult launch = rootShell("am start -W -a android.intent.action.MAIN"
+                + " -c org.matrix.vector.manager.LAUNCH_MANAGER"
+                + " -n com.android.shell/.BugreportWarningActivity", 15);
+        boolean started = launch.ok() && launch.out.contains("Status: ok")
+                && !launch.out.contains("Error:") && !launch.out.contains("Exception");
+        return result.append(started
+                ? "✅ 已发送 Vector 管理器启动请求（框架是否激活请以管理器显示为准）\n"
+                : "✗ Vector 管理器启动失败\n")
+                .append("exit=").append(launch.exit).append(", timeout=")
+                .append(launch.timedOut).append('\n').append(launch.out.trim()).toString();
+    }
+
     /** v33/v34: 每次执行前由服务端调用。顺序不可换：先把上一会话的
      * .gr_state / .gr_verdict 存进内存字段（供会话头归档），再删文件。
      * v34 之前先删后归档，导致"上次异常中断"的证据被清理动作自己抹掉。 */
@@ -1414,11 +1447,8 @@ public class RootUserService extends IRootRunner.Stub {
              * emulated-soft-reboot.sh（zygiskd exit 干净退出）并在 stop 前重跑
              * post-fs-data → daemon 先于新 zygote 就位 → 注入成功（实测
              * zygote_states:2 / preloaded 3/3 modules / modules_with_issue:0）。 */
-            /* v68: 修复时序 —— 不在软重启前 6 秒空窗期提前强杀 vectord（否则 Zygote
-             * 在这 6 秒内遇到 DEAD_OBJECT 会崩溃/死锁）。将清理合并至 setsid 软重启
-             * 触发的同一瞬间（sleep 6 结束后）执行。 */
+            // Vector 的退出交给 KernelSU 模块生命周期；软重启命令执行前框架仍在使用它。
             rootShell("setsid sh -c 'sleep 6; "
-                    + "for p in $(pgrep -f '\''[v]ectord'\'' 2>/dev/null); do kill $p 2>/dev/null; done; "
                     + "rm -f /data/adb/zygisksu/.abort_msg "
                     + ZN_MODDIR + "/disable; /data/adb/ksud soft-reboot' "
                     + ">/dev/null 2>&1 </dev/null &", 8);

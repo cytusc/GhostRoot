@@ -5,11 +5,16 @@
 # 重跑，纯 stop/start 不触发 —— 守护无人接手，模块自写 "(❌Disabled)"。
 # 本脚本等价「再执行一次模块自带的 boot-completed.sh」，只补进程不存在
 # 的模块；守护已经活着的直接跳过（幂等）。修复动作全部来自模块作者
-# 自己的启动脚本 —— GhostRoot 不改任何模块内部的配置或逻辑。
+# 自己的启动脚本；安装了看门狗时由它统一负责 SuToaster 的启动。
 REVIVED=0
 
 # --- ksuGrantToast（SuToaster）---
-if pidof SuToaster >/dev/null 2>&1; then
+if [ -f /data/adb/modules/ksuGrantToast/disable ] || [ -f /data/adb/modules/ksuGrantToast/remove ]; then
+    echo "ksuGrantToast: module disabled or removed, skip"
+elif [ -f /data/adb/service.d/99-ksuGrantToast-watchdog.sh ]; then
+    # 看门狗会等待 sulog 就绪后启动，避免两个恢复入口互相杀掉进程。
+    echo "ksuGrantToast: recovery delegated to watchdog"
+elif pidof SuToaster >/dev/null 2>&1; then
     echo "ksuGrantToast: SuToaster alive (pid=$(pidof SuToaster))"
 else
     if [ -f /data/adb/modules/ksuGrantToast/boot-completed.sh ]; then

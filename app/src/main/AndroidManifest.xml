@@ -13,6 +13,10 @@
         android:name="com.hoyo.ghostroot.permission.START_SERVICE"
         android:protectionLevel="signature" />
 
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
     <application
         android:allowBackup="false"
         android:label="GhostRoot"

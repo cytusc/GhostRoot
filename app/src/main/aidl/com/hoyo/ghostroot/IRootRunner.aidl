@@ -15,4 +15,5 @@ interface IRootRunner {
      * dex2oat-flags 清除（工行保活）-> 状态回读。rc: 0=完成, 2=忙碌,
      * 3=root 未落地, 其他=失败。 */
     void znRepair(ILogCallback callback);
+    String openVectorManager();
 }
