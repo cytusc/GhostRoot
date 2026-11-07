@@ -750,12 +750,20 @@ public class RootUserService extends IRootRunner.Stub {
                 + (rootVerified ? "uid=0 ✓ VERIFIED" : "NOT verified -> " + lastSu));
         String magica = "";
         if (rootVerified) {
+            /* v69-diag (移植自实验分支 v76 9027fef): 收尾链重排序 ——
+             * attemptPstoreSample 提到最前。理由：本日 2026-11-07 两次
+             * "落地→收尾窗口复位"（09:02 / 09:08 命中后 boot_id 变化）把
+             * root 连同当轮 verdict 一起送走，pstore 里存着的历次内核
+             * panic 现场（wedge 的真正归因证据）始终没被读出来。pstore
+             * 采样是只读快照，排在所有会动 ksud/框架的步骤（magica/
+             * uapi/zygisk）之前：哪怕收尾链后面再出事，现场（含上一个
+             * panic）也已归档落袋。 */
+            attemptPstoreSample(callback, true);
             /* v18: root is live on this boot — patch the manager's libksud
              * now so opening KernelSU manager can never re-run magica
              * cold-start (the wedge/reboot trap). */
             magica = runMagicaFix(callback);
             lastMagica = magica;
-            attemptPstoreSample(callback, true);
             /* v35: W1c 摘除去证 —— one.sh v5 用 dfroot_vr.ko 摘除 vr.ko
              * sys_exit 探针，dmesg 的 "W1c vr sys_exit probe disarmed" 是唯一证据行 */
             lastVrDisarmed = vrDisarmProbe();
