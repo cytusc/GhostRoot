@@ -1,4 +1,4 @@
-# GhostRoot APK 工程（v17）
+# GhostRoot APK 工程
 
 手机端一键提权 App，通过 **Shizuku UserService** 拿到 adb shell 等价权限，
 在手机内直接跑 exploit 链（不依赖 PC）。
@@ -6,10 +6,21 @@
 ## 版本
 
 ```
-versionCode  45
-versionName  2.29
-UserService  32       ← 改 RootUserService 逻辑必须同步 +1
+versionCode  76
+versionName  2.60
+UserService  44       ← 改 RootUserService 逻辑必须同步 +1
 ```
+
+### v76（2026-11-09，uapi5 签发者与 UI 证据链修正）
+
+| 修复项 | 位置 | 备注 |
+|---|---|---|
+| `uapiGuard()` 加 ksud-gk MD5 门禁（只认 `2432bd63…a0c5a`，不符拒绝替换） | `RootUserService.java` | 防坏 ksud 刷入后续模块链与 sepolicy 静默失效；uapi 已正确则不影响主流程 |
+| 软重启按 uapi 选签发者：`/data/adb/ksud` 为 uapi2 时改用 `ksud-gk`（uapi5）发 `soft-reboot` | `RootUserService.java` | uapi2 发软重启会静默失败（模块/sepolicy 注入跳过）；回落逻辑保留原路径，属尽力而为分支 |
+| `MainActivity.onResume()` 先 `showInterruptedBanner()` 再 `attach()` 回放结论 | `MainActivity.java` | `attach()` 会置 `lastDoneConsumed=true`，先回放会覆盖横幅 |
+| 版本三齐 `76 / 2.60 / 44`（`GhostRootService` 与 `MainActivity` 两处 `version(44)`） | 构建配置 + Java | 强制新 UserService，不复用旧进程 |
+
+> 离线门禁 `scripts/tests/offline_profile_test.py` 通过：`profile.bin` MD5 与已验产物一致、multicast_waiter 偏移可复现、执行参数与实测 tuned reference 对齐。v76 未改提权时序/亲和性/重试轮数/profile 字节。
 
 ### v45（2026-11-03，06:59 硬重启事故修复 —— 同 boot 二次开火）
 

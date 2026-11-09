@@ -209,8 +209,9 @@ public class GhostRootService extends Service {
                  * v68: 移除所有激进守护与强杀逻辑，还原原生 service.sh，bump 39→40。
                  * 新增 Vector 管理器 AIDL 方法，bump 40→41。
                  * 软重启不再提前杀 Vector，模块恢复交给看门狗，bump 41→42。
-                 * LSPosed 管理器替换 Vector，AIDL 更新，bump 42→43。 */
-                .version(43);
+                 * LSPosed 管理器替换 Vector，AIDL 更新，bump 42→43。
+                 * v76: uapiGuard 加 ksud-gk md5 门禁 + 软重启按 uapi 签发者，bump 43→44。 */
+                .version(44);
     }
 
     @Override

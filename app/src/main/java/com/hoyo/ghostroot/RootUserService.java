@@ -1282,7 +1282,11 @@ public class RootUserService extends IRootRunner.Stub {
      * /data/adb/ksud -V 的 "(uapi: N)"，与内核期望不符时自动换装
      * /data/local/tmp/ksud-gk（uapi:5）。直写被 vivo LSM 拒时退到
      * b0 atcid_vendor_socket 通道（2026-11-02 实测可用）。尽力而为，
-     * 失败只记录不阻塞 —— 换装失败只影响后续模块安装，不影响 root。 */
+     * 失败只记录不阻塞 —— 换装失败只影响后续模块安装，不影响 root。
+     * v76: 换装前先校验 ksud-gk 的 md5（与项目已验产物一致性），防用到
+     * 旧版/错误 ksud 把模块链和 sepolicy 注入一并带崩。
+     * 同时记录签发路径供后续软重启选签发者：v76 起 zygiskAutoActivate
+     * 的 ksud soft-reboot 走 ksud-gk，绕开 uapi2 软重启即静默失败的坑。 */
     private String uapiGuard(ILogCallback callback) {
         try {
             ShellResult v = rootShell("/data/adb/ksud -V 2>/dev/null", 15);
@@ -1292,6 +1296,16 @@ public class RootUserService extends IRootRunner.Stub {
             }
             if (!new File(TMP, "ksud-gk").isFile()) {
                 return "uapi" + uapi + "-mismatch-no-gk";
+            }
+            /* v76: ksud-gk 完整性门禁 —— md5 只认 2026-11-03 已验的 uapi5 签发产物。
+             * 直接 cp 会把旧版本/错误 ksud 换到 /data/adb/ksud，后续模块安装与
+             * sepolicy 注入静默失败，比 uapi2 报错还难排查。 */
+            ShellResult gkMd5 = rootShell("md5sum /data/local/tmp/ksud-gk 2>/dev/null", 10);
+            String md5 = gkMd5.out == null ? "" : gkMd5.out.trim();
+            if (!md5.startsWith("2432bd6318e9f97f9fa445ee9cba0c5a")) {
+                log(callback, "uapi guard: ksud-gk md5=" + md5
+                        + " != proven(2432bd63...) — refusing swap, treat as no-gk");
+                return "uapi" + uapi + "-mismatch-bad-gk(md5)";
             }
             log(callback, "uapi guard: /data/adb/ksud is uapi" + uapi
                     + ", kernel needs uapi" + EXPECTED_KSUD_UAPI + " — swapping");
@@ -1440,10 +1454,27 @@ public class RootUserService extends IRootRunner.Stub {
              * emulated-soft-reboot.sh（zygiskd exit 干净退出）并在 stop 前重跑
              * post-fs-data → daemon 先于新 zygote 就位 → 注入成功（实测
              * zygote_states:2 / preloaded 3/3 modules / modules_with_issue:0）。 */
+            /* v76: 软重启签发者按 uapi 选择签发路径。/data/adb/ksud 是 uapi2 时，
+             * soft-reboot 模块管理/sepolicy 注入静默失败（service.sh 内部
+             * emulated-soft-reboot.sh 也救不了），此时必须走 ksud-gk(uapi5)。
+             * md5 不符或 ksud-gk 缺失则回落到原路径（尽力而为，不让软重启整条链失灵）。 */
+            String softRebootBin = "/data/adb/ksud";
+            ShellResult gkCheck = rootShell(
+                    "md5sum /data/local/tmp/ksud-gk 2>/dev/null | grep -q 2432bd6318e9f97f9fa445ee9cba0c5a && echo ok || echo no", 8);
+            String ksudUapi = "";
+            ShellResult kv = rootShell("/data/adb/ksud -V 2>/dev/null", 8);
+            if (kv.ok()) ksudUapi = kv.out == null ? "" : kv.out;
+            if (ksudUapi.contains("uapi: 2")
+                    && gkCheck.out != null && "ok".equals(gkCheck.out.trim())
+                    && new File(TMP, "ksud-gk").isFile()) {
+                softRebootBin = "/data/local/tmp/ksud-gk";
+                log(callback, "zygisk: /data/adb/ksud is uapi2 — using ksud-gk (uapi5) for soft-reboot");
+            }
             // LSPosed 的退出交给 KernelSU 模块生命周期；软重启命令执行前框架仍在使用它。
+            final String softBin = softRebootBin;
             rootShell("setsid sh -c 'sleep 6; "
                     + "rm -f /data/adb/zygisksu/.abort_msg "
-                    + ZN_MODDIR + "/disable; /data/adb/ksud soft-reboot' "
+                    + ZN_MODDIR + "/disable; " + softBin + " soft-reboot' "
                     + ">/dev/null 2>&1 </dev/null &", 8);
             // v49: 用户决策（保工行）—— 软重启后 lsposed zygisk 模块在新 zygote
             // 初始化时会重设 dex2oat-flags（工行闪退根因，POSTMORTEM 问题1），

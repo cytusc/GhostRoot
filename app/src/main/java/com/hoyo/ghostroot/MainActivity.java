@@ -299,8 +299,12 @@ public class MainActivity extends Activity {
         } else if (GhostRootService.hasPendingResult()) {
             /* v32: 页面销毁期间任务结束的情况 —— idle 也要重连一次，
              * 否则最后一次结论在重开页面后丢失 */
-            GhostRootService.attach(activitySink);
+            /* v76: 顺序修正 —— attach() 会把 lastDone 回放并置 lastDoneConsumed=true，
+             * 若先 attach 再 showInterruptedBanner，终端快照（中断横幅）会被
+             * attach 的结论覆盖/漏显，且第二次 attach 时 hasPendingResult 已 false。
+             * 先出横幅、再 attach 交付结论，保证两路证据都落在 UI 上。 */
             showInterruptedBanner();
+            GhostRootService.attach(activitySink);
         } else {
             showInterruptedBanner();
         }
@@ -970,7 +974,7 @@ public class MainActivity extends Activity {
             lsposedServiceArgs = new Shizuku.UserServiceArgs(
                     new android.content.ComponentName(this, RootUserService.class))
                     .tag("lsposed-manager").processNameSuffix("lsposed")
-                    .daemon(false).debuggable(false).version(43);
+                    .daemon(false).debuggable(false).version(44);
             lsposedConnection = new android.content.ServiceConnection() {
                 @Override
                 public void onServiceConnected(android.content.ComponentName name, android.os.IBinder binder) {
