@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import rikka.shizuku.Shizuku;
 
 /** Device check: Shizuku must be running and GhostRoot already authorized. */
-public class VectorSmokeTest extends Instrumentation {
+public class LsposedSmokeTest extends Instrumentation {
     @Override
     public void onCreate(Bundle arguments) {
         super.onCreate(arguments);
@@ -25,8 +25,8 @@ public class VectorSmokeTest extends Instrumentation {
         Bundle result = new Bundle();
         Shizuku.UserServiceArgs args = new Shizuku.UserServiceArgs(
                 new ComponentName(getTargetContext(), RootUserService.class))
-                .tag("vector-smoke-test").processNameSuffix("vector_test")
-                .daemon(false).version(42);
+                .tag("lsposed-smoke-test").processNameSuffix("lsposed_test")
+                .daemon(false).version(43);
         CountDownLatch connected = new CountDownLatch(1);
         AtomicReference<IRootRunner> runner = new AtomicReference<>();
         ServiceConnection connection = new ServiceConnection() {
@@ -39,7 +39,7 @@ public class VectorSmokeTest extends Instrumentation {
         int code = -1;
         try {
             // App-context failure must be reported, never mistaken for success.
-            String local = new RootUserService(getTargetContext()).openVectorManager();
+            String local = new RootUserService(getTargetContext()).openLsposedManager();
             if (!local.startsWith("✗ Shizuku 通道无法取得 root")) {
                 throw new AssertionError("Expected unavailable app su on this device: " + local);
             }
@@ -47,11 +47,11 @@ public class VectorSmokeTest extends Instrumentation {
             if (!connected.await(15, TimeUnit.SECONDS)) {
                 throw new AssertionError("Shizuku UserService did not connect");
             }
-            String remote = runner.get().openVectorManager();
+            String remote = runner.get().openLsposedManager();
             if (!remote.contains("✅ 已发送") || !remote.contains("Status: ok")) {
-                throw new AssertionError("Vector launch failed: " + remote);
+                throw new AssertionError("Lsposed launch failed: " + remote);
             }
-            result.putString("stream", "PASS: app su unavailable; Shizuku Vector launch succeeded\n" + remote);
+            result.putString("stream", "PASS: app su unavailable; Shizuku LSPosed launch succeeded\n" + remote);
         } catch (Throwable e) {
             code = 1;
             result.putString("stream", "FAIL: " + e);

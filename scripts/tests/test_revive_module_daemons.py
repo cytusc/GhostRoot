@@ -10,7 +10,7 @@ ASSET = Path(__file__).resolve().parents[2] / "app/src/main/assets/revive_module
 
 
 class ModuleRecoveryTest(unittest.TestCase):
-    def run_recovery(self, *, flag=None, watchdog=False, alive=False):
+    def run_recovery(self, *, flag=None, watchdog=False, alive=False, lsposed=False, lsposed_flag=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             module = root / "data/adb/modules/ksuGrantToast"
@@ -22,6 +22,17 @@ class ModuleRecoveryTest(unittest.TestCase):
                 service = root / "data/adb/service.d"
                 service.mkdir()
                 (service / "99-ksuGrantToast-watchdog.sh").touch()
+            if lsposed:
+                framework = root / "data/adb/modules/zygisk_lsposed"
+                framework.mkdir()
+                (framework / "service.sh").write_text("official service script\n")
+                if lsposed_flag:
+                    (framework / lsposed_flag).touch()
+                ksu = root / "data/adb/ksu/bin"
+                ksu.mkdir(parents=True)
+                resetprop = ksu / "resetprop"
+                resetprop.write_text('#!/bin/sh\necho "resetprop $*" >> "$CALLS"\n')
+                resetprop.chmod(0o755)
             commands = root / "bin"
             commands.mkdir()
             stubs = {
@@ -42,7 +53,16 @@ class ModuleRecoveryTest(unittest.TestCase):
                        ALIVE=str(int(alive)), CALLS=str(calls))
             result = subprocess.run(["sh", str(script)], env=env, capture_output=True,
                                     text=True, timeout=5, check=True)
+            if lsposed:
+                self.assertEqual("official service script\n", (framework / "service.sh").read_text())
             return result.stdout, calls.read_text() if calls.exists() else ""
+
+    def test_lsposed_only_clears_property_when_enabled(self):
+        for flag in (None, "disable", "remove"):
+            with self.subTest(flag=flag):
+                _, calls = self.run_recovery(alive=True, lsposed=True, lsposed_flag=flag)
+                expected = "resetprop --delete dalvik.vm.dex2oat-flags\n" if flag is None else ""
+                self.assertEqual(expected, calls)
 
     def test_disabled_or_removed_module_is_not_started(self):
         for flag in ("disable", "remove"):

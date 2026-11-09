@@ -208,8 +208,9 @@ public class GhostRootService extends Service {
                  * v67: Vector 寄生启动补充 LAUNCH_MANAGER Category 修正错误报告弹窗，bump 38→39。
                  * v68: 移除所有激进守护与强杀逻辑，还原原生 service.sh，bump 39→40。
                  * 新增 Vector 管理器 AIDL 方法，bump 40→41。
-                 * 软重启不再提前杀 Vector，模块恢复交给看门狗，bump 41→42。 */
-                .version(42);
+                 * 软重启不再提前杀 Vector，模块恢复交给看门狗，bump 41→42。
+                 * LSPosed 管理器替换 Vector，AIDL 更新，bump 42→43。 */
+                .version(43);
     }
 
     @Override

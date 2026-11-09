@@ -22,11 +22,12 @@ root_ok() {
 }
 
 ensure_fire() {
-  pid=$(a shell 'cat /data/local/tmp/.fire.pid 2>/dev/null' 2>/dev/null | tr -d '\r\n')
-  if [ -n "$pid" ] && a shell "kill -0 $pid 2>/dev/null" >/dev/null 2>&1; then
+  pidline=$(a shell 'cat /data/local/tmp/.fire.pid 2>/dev/null' 2>/dev/null | tr -d '\r')
+  pid=${pidline%% *}
+  if [[ "$pid" =~ ^[0-9]+$ ]] && a shell "test -r /proc/$pid/cmdline && grep -aq fire.sh /proc/$pid/cmdline" >/dev/null 2>&1; then
     log "fire watcher alive pid=$pid"
   else
-    a shell 'rm -f /data/local/tmp/.fired /data/local/tmp/.fire.pid; nohup sh /data/local/tmp/fire.sh >/dev/null 2>&1 & sleep 1; echo newpid=$(cat /data/local/tmp/.fire.pid 2>/dev/null)'
+    a shell 'nohup sh /data/local/tmp/fire.sh >/dev/null 2>&1 & sleep 1; echo newpid=$(cat /data/local/tmp/.fire.pid 2>/dev/null)'
     log "fire watcher restarted"
   fi
 }

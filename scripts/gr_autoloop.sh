@@ -384,9 +384,9 @@ zn_status_ok() {
     [ "${zygotes:-0}" -ge 2 ] || return 1
     [ "${issues:-1}" -eq 0 ] || return 1
     echo "$m64" | grep -q 'hma_oss_zygisk' || return 1
-    echo "$m64" | grep -q 'zygisk_vector' || return 1
+    echo "$m64" | grep -q 'zygisk_lsposed' || return 1
     echo "$m32" | grep -q 'hma_oss_zygisk' || return 1
-    echo "$m32" | grep -q 'zygisk_vector' || return 1
+    echo "$m32" | grep -q 'zygisk_lsposed' || return 1
     return 0
 }
 
@@ -859,7 +859,7 @@ while true; do
             echo "su -c id:"
             a shell 'su -c id 2>/dev/null' 2>/dev/null | tr -d '\r'
         } | tee -a "$TEE_LOG"
-        # v51: 提权成功 ≠ 全栈可用 —— ZN 注入/Vector/dex2oat 副作用还要
+        # v51: 提权成功 ≠ 全栈可用 —— ZN 注入/Lsposed/dex2oat 副作用还要
         # 靠修复链闭环，且必须验证结果（留痕 + status + 工行/闩锁）
         if run_repair_and_verify "$BOOT"; then
             REPAIR_RESULT="OK"

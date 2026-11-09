@@ -43,7 +43,7 @@ public class MainActivity extends Activity {
     private static final String ACTION_ADB_RUN = "com.hoyo.ghostroot.action.ADB_RUN";
     private static final String ACTION_ADB_REPAIR = "com.hoyo.ghostroot.action.ADB_REPAIR";
     private static final String ACTION_ADB_START_SHIZUKU = "com.hoyo.ghostroot.action.ADB_START_SHIZUKU";
-    private static final String ACTION_ADB_OPEN_VECTOR = "com.hoyo.ghostroot.action.ADB_OPEN_VECTOR";
+    private static final String ACTION_ADB_OPEN_LSPOSED = "com.hoyo.ghostroot.action.ADB_OPEN_LSPOSED";
 
     private TextView logView;
     private Button runButton;
@@ -54,10 +54,10 @@ public class MainActivity extends Activity {
      * 不依赖 PC / 无线调试；启动完即可点「Zygisk 修复」。 */
     private Button shizukuRootButton;
     private static final String BTN_SHIZUKU_ROOT = "启动 Shizuku（root，提权后点我）";
-    /** v66: 打开 Vector 管理器 —— 针对 Vector 寄生架构在 Enforcing 下
+    /** v66: 打开 LSPosed 管理器 —— 针对 LSPosed 寄生架构在 Enforcing 下
      * 点桌面独立图标报"未激活"的问题，以 root 调起 com.android.shell 寄生端。 */
-    private Button openVectorButton;
-    private static final String BTN_OPEN_VECTOR = "打开 Vector 管理器（root 直达）";
+    private Button openLsposedButton;
+    private static final String BTN_OPEN_LSPOSED = "打开 LSPosed 管理器（root 直达）";
     /** v26: sink 做成字段，onResume 自动重挂 —— Activity 被销毁重建后
      * 也能继续收到日志与结束回调（服务端有缓冲回放）。 */
     private GhostRootService.Sink activitySink;
@@ -125,8 +125,8 @@ public class MainActivity extends Activity {
         final boolean run = ACTION_ADB_RUN.equals(action);
         final boolean repair = ACTION_ADB_REPAIR.equals(action);
         final boolean startShizuku = ACTION_ADB_START_SHIZUKU.equals(action);
-        final boolean openVector = ACTION_ADB_OPEN_VECTOR.equals(action);
-        if (!run && !repair && !startShizuku && !openVector) {
+        final boolean openLsposed = ACTION_ADB_OPEN_LSPOSED.equals(action);
+        if (!run && !repair && !startShizuku && !openLsposed) {
             return;
         }
         int uid = android.os.Binder.getCallingUid();
@@ -136,7 +136,7 @@ public class MainActivity extends Activity {
             append("收到 " + action + " 但调用方 uid=" + uid + " 不在白名单，忽略");
             return;
         }
-        append("ADB 触发 " + (run ? "执行" : repair ? "ZN 修复" : startShizuku ? "root 启动 Shizuku" : "打开 Vector")
+        append("ADB 触发 " + (run ? "执行" : repair ? "ZN 修复" : startShizuku ? "root 启动 Shizuku" : "打开 LSPosed")
                 + "（caller uid=" + uid + "），1.5s 后开始…");
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         runButton.postDelayed(() -> {
@@ -148,7 +148,7 @@ public class MainActivity extends Activity {
                 } else if (startShizuku) {
                     onStartShizukuRootClicked();
                 } else {
-                    onOpenVectorClicked();
+                    onOpenLsposedClicked();
                 }
             }
         }, 1500L);
@@ -234,13 +234,13 @@ public class MainActivity extends Activity {
         root.addView(shizukuRootButton, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        /* v66: 打开 Vector 管理器（root 直达） —— 针对 Vector 寄生架构直接点桌面图标
+        /* v66: 打开 LSPosed 管理器（root 直达） —— 针对 LSPosed 寄生架构直接点桌面图标
          * 报未激活的问题，通过 Shizuku 的 shell 通道调起寄生端 Activity。 */
-        openVectorButton = new Button(this);
-        openVectorButton.setText(BTN_OPEN_VECTOR);
-        openVectorButton.setEnabled(true);
-        openVectorButton.setOnClickListener(v -> onOpenVectorClicked());
-        root.addView(openVectorButton, new LinearLayout.LayoutParams(
+        openLsposedButton = new Button(this);
+        openLsposedButton.setText(BTN_OPEN_LSPOSED);
+        openLsposedButton.setEnabled(true);
+        openLsposedButton.setOnClickListener(v -> onOpenLsposedClicked());
+        root.addView(openLsposedButton, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         rebootButton = new Button(this);
@@ -338,7 +338,7 @@ public class MainActivity extends Activity {
         String zn = "";
         /* v64: verdict 的 uapi/net 字段 —— uapiGuard 换装（uapi2-to-5）后
          * sepolicy.rule 本 boot 注入失败（ksud 开机注入被 uapi 不匹配挡住），
-         * vector/LSPosed 在 Enforcing 下缺规则会报"selinux 异常/未激活"，
+         * LSPosed 在 Enforcing 下缺规则会报"selinux 异常/未激活"，
          * 软重启救不了 sepolicy，只有整机重启才能恢复。UI 据此如实提示。 */
         String uapi = "";
         String net = "";
@@ -437,13 +437,13 @@ public class MainActivity extends Activity {
             /* v64: 「已修复」不再禁点 —— freshThisBoot 用内核 uptime 判
              * "本 boot"，框架软重启（stop/start、ksud soft-reboot）不清
              * uptime，zn-ok 留痕会跨软重启"保鲜"；但软重启后 zygote 重生，
-             * Zygisk/vector 可能已重新失效，灰死按钮让用户无法再触发修复
+             * Zygisk/lsposed 可能已重新失效，灰死按钮让用户无法再触发修复
              * （2026-11-06 实测复现）。改诚实可点态：留痕照展示，允许随时
              * 复查（修复链幂等，已 hook 时 zn-ok 直接收尾，不重复软重启）。
-             * sepolicyPending 时额外提示：vector 的 selinux 异常需整机重启。 */
+             * sepolicyPending 时额外提示：lsposed 的 selinux 异常需整机重启。 */
             repairButton.setEnabled(true);
             repairButton.setText(sepolicyPending
-                    ? "✅ 已修复（sepolicy 待整机重启，vector 可能仍异常）"
+                    ? "✅ 已修复（sepolicy 待整机重启，LSPosed 可能仍异常）"
                     : "✅ 已修复（本 boot）— 可再点复查");
         } else if (repairScheduled) {
             /* v56: 已调度软重启但 Zygisk 未确认激活 —— 诚实状态，可点复查 */
@@ -649,7 +649,7 @@ public class MainActivity extends Activity {
      * 硬前提：修复经 UserService 的 su 通道执行），区别只在 action 与按钮态。
      * v64: v58 的「已修复防误触」硬拦截废除 —— 留痕 ts 用内核 uptime 判
      * "本 boot"，框架软重启不清 uptime，软重启后 zygote 重生、留痕可能
-     * 已过期（vector/toast 重新失效），此时点修复却被门禁吞掉、按钮还
+     * 已过期（lsposed/toast 重新失效），此时点修复却被门禁吞掉、按钮还
      * 被 refreshButtonStates 灰死，用户无法再触发修复（2026-11-06 实测
      * 复现）。复查重跑本身安全：修复链幂等，zygote 已 hook 时
      * zygiskAutoActivate 直接 zn-ok 收尾，不会重复调度软重启。 */
@@ -720,7 +720,7 @@ public class MainActivity extends Activity {
         }
         if (alreadyRepaired) {
             /* v64: 不再 return/禁点 —— 留痕可能在框架软重启后已过期
-             * （zygote 重生，Zygisk/vector 重新失效），如实提示后放行复查 */
+             * （zygote 重生，Zygisk/lsposed 重新失效），如实提示后放行复查 */
             append("ℹ 本 boot 已有修复留痕（" + (markZnOkFresh ? "znRepair 成功" : "会话 zn-ok")
                     + "）—— 允许复查重跑：软重启后 zygote 重生，留痕可能已过期");
         }
@@ -943,80 +943,80 @@ public class MainActivity extends Activity {
         shizukuRootButton.setText(BTN_SHIZUKU_ROOT);
     }
 
-    private Shizuku.UserServiceArgs vectorServiceArgs;
-    private android.content.ServiceConnection vectorConnection;
-    private final Runnable vectorBindTimeout = () -> {
-        append("连接 Shizuku Vector 通道超时，请确认 Shizuku 正在运行且已授权");
-        releaseVectorService();
+    private Shizuku.UserServiceArgs lsposedServiceArgs;
+    private android.content.ServiceConnection lsposedConnection;
+    private final Runnable lsposedBindTimeout = () -> {
+        append("连接 Shizuku LSPosed 通道超时，请确认 Shizuku 正在运行且已授权");
+        releaseLsposedService();
     };
 
-    private void onOpenVectorClicked() {
-        if (vectorConnection != null) return;
+    private void onOpenLsposedClicked() {
+        if (lsposedConnection != null) return;
         if (!Shizuku.pingBinder()) {
-            append("Shizuku 未运行，请先启动 Shizuku，再打开 Vector 管理器");
+            append("Shizuku 未运行，请先启动 Shizuku，再打开 LSPosed 管理器");
             return;
         }
         try {
             if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-                append("请授予 Shizuku 权限后，再点「打开 Vector 管理器」");
+                append("请授予 Shizuku 权限后，再点「打开 LSPosed 管理器」");
                 Shizuku.requestPermission(REQ_PERMISSION);
                 return;
             }
-            openVectorButton.setEnabled(false);
+            openLsposedButton.setEnabled(false);
             startForegroundService(new Intent(this, GhostRootService.class)
                     .setAction(GhostRootService.ACTION_START));
-            append("通过 Shizuku 检测 Vector 状态并调起管理器…");
-            // 独立 tag 避免解绑 Vector 时停止正在提权或修复的 UserService。
-            vectorServiceArgs = new Shizuku.UserServiceArgs(
+            append("通过 Shizuku 检测 LSPosed 状态并调起管理器…");
+            // 独立 tag 避免解绑 LSPosed 时停止正在提权或修复的 UserService。
+            lsposedServiceArgs = new Shizuku.UserServiceArgs(
                     new android.content.ComponentName(this, RootUserService.class))
-                    .tag("vector-manager").processNameSuffix("vector")
-                    .daemon(false).debuggable(false).version(42);
-            vectorConnection = new android.content.ServiceConnection() {
+                    .tag("lsposed-manager").processNameSuffix("lsposed")
+                    .daemon(false).debuggable(false).version(43);
+            lsposedConnection = new android.content.ServiceConnection() {
                 @Override
                 public void onServiceConnected(android.content.ComponentName name, android.os.IBinder binder) {
-                    openVectorButton.removeCallbacks(vectorBindTimeout);
+                    openLsposedButton.removeCallbacks(lsposedBindTimeout);
                     Thread worker = new Thread(() -> {
                         String result;
                         try {
-                            result = IRootRunner.Stub.asInterface(binder).openVectorManager();
+                            result = IRootRunner.Stub.asInterface(binder).openLsposedManager();
                         } catch (Exception e) {
-                            result = "唤起 Vector 异常: " + e;
+                            result = "唤起 LSPosed 异常: " + e;
                         }
                         final String message = result;
                         ui(() -> {
                             if (!isDestroyed()) append(message);
-                            releaseVectorService();
+                            releaseLsposedService();
                         });
-                    }, "open-vector-mgr");
+                    }, "open-lsposed-mgr");
                     worker.setDaemon(true);
                     worker.start();
                 }
 
                 @Override
                 public void onServiceDisconnected(android.content.ComponentName name) {
-                    append("Shizuku Vector 通道已断开，可重新点击尝试");
-                    releaseVectorService();
+                    append("Shizuku LSPosed 通道已断开，可重新点击尝试");
+                    releaseLsposedService();
                 }
             };
-            openVectorButton.postDelayed(vectorBindTimeout, 15_000L);
-            Shizuku.bindUserService(vectorServiceArgs, vectorConnection);
+            openLsposedButton.postDelayed(lsposedBindTimeout, 15_000L);
+            Shizuku.bindUserService(lsposedServiceArgs, lsposedConnection);
         } catch (Exception e) {
-            append("连接 Shizuku Vector 通道失败: " + e);
-            releaseVectorService();
+            append("连接 Shizuku LSPosed 通道失败: " + e);
+            releaseLsposedService();
         }
     }
 
-    private void releaseVectorService() {
-        openVectorButton.removeCallbacks(vectorBindTimeout);
-        if (vectorConnection != null) {
+    private void releaseLsposedService() {
+        openLsposedButton.removeCallbacks(lsposedBindTimeout);
+        if (lsposedConnection != null) {
             try {
-                Shizuku.unbindUserService(vectorServiceArgs, vectorConnection, true);
+                Shizuku.unbindUserService(lsposedServiceArgs, lsposedConnection, true);
             } catch (Exception e) {
-                if (!isDestroyed()) append("释放 Vector 通道失败: " + e);
+                if (!isDestroyed()) append("释放 LSPosed 通道失败: " + e);
             }
-            vectorConnection = null;
+            lsposedConnection = null;
         }
-        openVectorButton.setEnabled(true);
+        openLsposedButton.setEnabled(true);
     }
 
     /** 同步执行一条 su 命令并合并 stdout/stderr；带 12s 超时，绝不永久阻塞。 */
@@ -1074,7 +1074,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        releaseVectorService();
+        releaseLsposedService();
         Shizuku.removeBinderReceivedListener(binderReceived);
         Shizuku.removeBinderDeadListener(binderDead);
         Shizuku.removeRequestPermissionResultListener(permissionListener);

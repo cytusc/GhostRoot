@@ -59,24 +59,10 @@ else
     fi
 fi
 
-# --- zygisk_vector（安全治理：保工行属性清理与模块脚本自愈）---
-# 参考 GitHub JingMatrix/Vector #878：软重启下 vectord 重复由上游 R8 混淆
-# strip 锁句柄导致，已在上游 PR #1049 修复。
-# 在系统运行时强杀 vectord 会导致活跃 Zygote/System Server 抛出 DEAD_OBJECT
-# 进而发生死锁或崩溃；因此本脚本绝不主动强杀或异步重拉 vectord。
-# 此处：1) 若之前写入过单实例守卫补丁，自动剔除以还原官方原生 service.sh
-#       2) 幂等清除 dalvik.vm.dex2oat-flags（保工行）
-if [ -d /data/adb/modules/zygisk_vector ]; then
-    # 1. 还原 service.sh 原版，清除 GhostRoot 曾注入的单实例补丁
-    if [ -f /data/adb/modules/zygisk_vector/service.sh ]; then
-        if grep -q "GhostRoot: single-instance guard" /data/adb/modules/zygisk_vector/service.sh 2>/dev/null; then
-            sed -i '/GhostRoot: single-instance guard/d' /data/adb/modules/zygisk_vector/service.sh 2>/dev/null
-            sed -i '/\[v\]ectord/d' /data/adb/modules/zygisk_vector/service.sh 2>/dev/null
-            echo "Vector: service.sh restored to original upstream version"
-        fi
-    fi
-
-    # 2. 幂等清除 dex2oat-flags（保工行）
+# --- LSPosed：保留既有 dex2oat 属性清理，不改写或重启框架守护 ---
+if [ -d /data/adb/modules/zygisk_lsposed ] && \
+   [ ! -f /data/adb/modules/zygisk_lsposed/disable ] && \
+   [ ! -f /data/adb/modules/zygisk_lsposed/remove ]; then
     /data/adb/ksu/bin/resetprop --delete dalvik.vm.dex2oat-flags 2>/dev/null
 fi
 

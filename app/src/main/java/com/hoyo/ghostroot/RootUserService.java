@@ -193,34 +193,27 @@ public class RootUserService extends IRootRunner.Stub {
     }
 
     @Override
-    public String openVectorManager() {
+    public String openLsposedManager() {
         ShellResult who = rootShell("id -u", 12);
         if (!who.ok() || !"0".equals(who.out.trim())) {
             return "✗ Shizuku 通道无法取得 root（exit=" + who.exit
                     + ", timeout=" + who.timedOut + "）: " + who.out.trim();
         }
-        ShellResult module = rootShell("test -d /data/adb/modules/zygisk_vector", 12);
+        ShellResult module = rootShell("test -f /data/adb/modules/zygisk_lsposed/daemon"
+                + " && test ! -f /data/adb/modules/zygisk_lsposed/disable"
+                + " && test ! -f /data/adb/modules/zygisk_lsposed/remove", 12);
         if (!module.ok()) {
-            return "✗ 无法访问 Vector 模块（exit=" + module.exit
+            return "✗ LSPosed 模块未安装、已停用或无法访问（exit=" + module.exit
                     + ", timeout=" + module.timedOut + "）: " + module.out.trim();
         }
-        ShellResult status = rootShell("sh /data/adb/modules/zygisk_vector/cli status", 20);
-        StringBuilder result = new StringBuilder();
-        if (status.ok()) {
-            result.append("Vector 状态: ").append(status.out.trim()).append('\n');
-        } else {
-            result.append("⚠ Vector 状态读取失败（exit=").append(status.exit)
-                    .append(", timeout=").append(status.timedOut).append("）: ")
-                    .append(status.out.trim()).append('\n');
-        }
         ShellResult launch = rootShell("am start -W -a android.intent.action.MAIN"
-                + " -c org.matrix.vector.manager.LAUNCH_MANAGER"
+                + " -c org.lsposed.manager.LAUNCH_MANAGER"
                 + " -n com.android.shell/.BugreportWarningActivity", 15);
         boolean started = launch.ok() && launch.out.contains("Status: ok")
                 && !launch.out.contains("Error:") && !launch.out.contains("Exception");
-        return result.append(started
-                ? "✅ 已发送 Vector 管理器启动请求（框架是否激活请以管理器显示为准）\n"
-                : "✗ Vector 管理器启动失败\n")
+        return new StringBuilder().append(started
+                ? "✅ 已发送 LSPosed 管理器启动请求（框架是否激活请以管理器显示为准）\n"
+                : "✗ LSPosed 管理器启动失败\n")
                 .append("exit=").append(launch.exit).append(", timeout=")
                 .append(launch.timedOut).append('\n').append(launch.out.trim()).toString();
     }
@@ -1447,12 +1440,12 @@ public class RootUserService extends IRootRunner.Stub {
              * emulated-soft-reboot.sh（zygiskd exit 干净退出）并在 stop 前重跑
              * post-fs-data → daemon 先于新 zygote 就位 → 注入成功（实测
              * zygote_states:2 / preloaded 3/3 modules / modules_with_issue:0）。 */
-            // Vector 的退出交给 KernelSU 模块生命周期；软重启命令执行前框架仍在使用它。
+            // LSPosed 的退出交给 KernelSU 模块生命周期；软重启命令执行前框架仍在使用它。
             rootShell("setsid sh -c 'sleep 6; "
                     + "rm -f /data/adb/zygisksu/.abort_msg "
                     + ZN_MODDIR + "/disable; /data/adb/ksud soft-reboot' "
                     + ">/dev/null 2>&1 </dev/null &", 8);
-            // v49: 用户决策（保工行）—— 软重启后 vector zygisk 模块在新 zygote
+            // v49: 用户决策（保工行）—— 软重启后 lsposed zygisk 模块在新 zygote
             // 初始化时会重设 dex2oat-flags（工行闪退根因，POSTMORTEM 问题1），
             // 延迟 ~120s 追加清除一次，盖住"prop 在会话结束后才被设置"的时序。
             rootShell("setsid sh -c 'sleep 120; /data/adb/ksu/bin/resetprop "
@@ -1473,10 +1466,7 @@ public class RootUserService extends IRootRunner.Stub {
         }
     }
 
-    /** v49: dex2oat-flags 清除（用户决策 2026-11-04：保工行，接受 vector
-     * 内联优化失效，AdClose 拦截功能不受影响）。vector 的 zygisk 模块在
-     * 新 zygote 初始化时会重设该 prop —— 本方法只压"激活窗口"内的设置，
-     * vectord 自行重启仍可能复活（根治需改 vector 侧脚本，见 P1 遗留）。 */
+    /** 保留既有工行兼容策略；框架初始化后再次清除该属性。 */
     private void deleteDex2oatFlags(ILogCallback callback, String tag) {
         rootShell("/data/adb/ksu/bin/resetprop --delete "
                 + "dalvik.vm.dex2oat-flags 2>/dev/null", 10);
