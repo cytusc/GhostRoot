@@ -11,11 +11,11 @@ android {
         applicationId = "com.hoyo.ghostroot"
         minSdk = 26
         targetSdk = 34
-        /* v79: 配套设备端 ghostlock grdiag5（MSG_PEEK 回读 oracle +
-         * W1 probe-then-fire）。native CLI 由 scripts/device-artifacts 单独
-         * push，APK 侧行为不变，仅递增版本以便与设备端二进制配对追溯。 */
-        versionCode = 79
-        versionName = "2.63"
+        /* v80: Compose 版 UI + ZN 单例收敛根治（zygiskAutoActivate：
+         * SIGKILL 收敛、收敛后重读 zygote_states、成功判据收紧为单例）。
+         * 设备侧沿用项目自有运行时资产，APK 版本不与任何实验构建绑定。 */
+        versionCode = 80
+        versionName = "2.64"
         testInstrumentationRunner = "com.hoyo.ghostroot.LsposedSmokeTest"
     }
 

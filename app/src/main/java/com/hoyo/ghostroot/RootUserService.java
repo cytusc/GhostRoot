@@ -1444,15 +1444,27 @@ public class RootUserService extends IRootRunner.Stub {
             int daemons = pidCount("zn-daemon");
             log(callback, "zygisk: zygote_states=" + zygotes + " zn-daemon=" + daemons);
             if (daemons != 1) {
-                rootShell("for p in $(pidof zn-daemon); do kill $p 2>/dev/null; done; "
+                /* 2026-11-10: kill(SIGTERM) 杀不掉 zn-daemon —— 实机日志证实
+                 * 每次触发修复实例数 2→3→4→5→6，多实例互抢 ptrace 注入使
+                 * zygote_states 掉回 0（根因即终态验证 FAIL）。改 SIGKILL
+                 * 并在 kill 后再起单例，确保收敛真的发生。 */
+                rootShell("for p in $(pidof zn-daemon); do kill -9 $p 2>/dev/null; done; "
                         + "sleep 1", 15);
                 rootShell("cd " + ZN_MODDIR + " && setsid nohup ./bin/zygiskd daemon "
                         + ">/dev/null 2>&1 </dev/null &", 10);
                 Thread.sleep(2000);
+                /* 2026-11-10: 收敛后必须重读 zygote_states。新起的单例 daemon
+                 * 尚未接驾新 zygote，沿用收敛前读到的旧值会返回 zn-ok-zygote2
+                 * 假成功（脚本随后复查终态 zygote_states=0 判 FAIL）。 */
+                st = rootShell(ZN_BIN + " status 2>/dev/null", 20);
+                zygotes = parseFieldInt(st.out, "zygote_states");
                 daemons = pidCount("zn-daemon");
-                log(callback, "zygisk: single-instance daemon -> zn-daemon=" + daemons);
+                log(callback, "zygisk: single-instance daemon -> zn-daemon=" + daemons
+                        + " zygote_states=" + zygotes);
             }
-            if (zygotes > 0 && daemons >= 1) {
+            /* 2026-11-10: daemons>=1 会放过收敛失败（6 个实例也判 zn-ok）；
+             * 只有收敛成唯一实例且确实注入了 zygote 才允许报成功。 */
+            if (zygotes > 0 && daemons == 1) {
                 deleteDex2oatFlags(callback, "zn-ok");
                 return "zn-ok-zygote" + zygotes;
             }
