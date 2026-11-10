@@ -10,8 +10,8 @@ android {
         applicationId = "com.hoyo.ghostroot"
         minSdk = 26
         targetSdk = 34
-        versionCode = 76
-        versionName = "2.60"
+        versionCode = 78
+        versionName = "2.62"
         testInstrumentationRunner = "com.hoyo.ghostroot.LsposedSmokeTest"
     }
 

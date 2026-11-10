@@ -974,7 +974,7 @@ public class MainActivity extends Activity {
             lsposedServiceArgs = new Shizuku.UserServiceArgs(
                     new android.content.ComponentName(this, RootUserService.class))
                     .tag("lsposed-manager").processNameSuffix("lsposed")
-                    .daemon(false).debuggable(false).version(44);
+                    .daemon(false).debuggable(false).version(46);
             lsposedConnection = new android.content.ServiceConnection() {
                 @Override
                 public void onServiceConnected(android.content.ComponentName name, android.os.IBinder binder) {

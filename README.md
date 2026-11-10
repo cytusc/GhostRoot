@@ -6,9 +6,9 @@
 ## 版本
 
 ```
-versionCode  76
-versionName  2.60
-UserService  44       ← 改 RootUserService 逻辑必须同步 +1
+versionCode  78
+versionName  2.62
+UserService  46       ← 改 RootUserService 逻辑必须同步 +1
 ```
 
 ### v76（2026-11-09，uapi5 签发者与 UI 证据链修正）
@@ -20,7 +20,42 @@ UserService  44       ← 改 RootUserService 逻辑必须同步 +1
 | `MainActivity.onResume()` 先 `showInterruptedBanner()` 再 `attach()` 回放结论 | `MainActivity.java` | `attach()` 会置 `lastDoneConsumed=true`，先回放会覆盖横幅 |
 | 版本三齐 `76 / 2.60 / 44`（`GhostRootService` 与 `MainActivity` 两处 `version(44)`） | 构建配置 + Java | 强制新 UserService，不复用旧进程 |
 
-> 离线门禁 `scripts/tests/offline_profile_test.py` 通过：`profile.bin` MD5 与已验产物一致、multicast_waiter 偏移可复现、执行参数与实测 tuned reference 对齐。v76 未改提权时序/亲和性/重试轮数/profile 字节。
+### v78（2026-11-10，实机 373 会话分析 —— 修正 v77 的两处严重误判）
+
+对 v77 安装后实机日志（`ghostroot-run.log`，373 个 exploit 会话）做了逐会话切分分析，发现并修正：
+
+**实机失败分布（373 会话）**：
+
+| 终点阶段 | 次数 | 占比 | 判读 |
+|---|---|---|---|
+| `route_done status=0`（成功路由） | 162 | 43% | 与 v76 基线 43.7% 持平 |
+| spray 完成后**静默 exit=1**（route 入口前，无任何错误输出） | 159 | 42% | 本征随机失败，失败快（p50 3.6s），多轮重试是唯一杠杆 |
+| CMP 后无 route_done（卡死） | 28 | 7% | v77 目标场景，实际占比远小于预估 |
+| 碰撞筛选/payload 阶段失败 | 21 | 6% | — |
+
+**v77 的两处修正**：
+
+| 修正项 | 原因 | v78 改法 |
+|---|---|---|
+| fire.sh 死锁窗口 10s → **60s**（100→600 迭代） | 成功会话 exploit start→route_done p50=3.5s / p90=9.4s / **max=16.1s**，落地（enforce=0）中位 9-13s、最长 35s+。10s 窗口会把近半数成功会话在落地前一刻杀掉 —— 典型"越改成功率越低"回归。60s 仍早于实测 ~60-90s watchdog 崩溃重启 | `scripts/device-artifacts/fire.sh` v10，已 adb push 到设备 |
+| `.fire.log` ROUTE_DEADLOCK 判定 `contains()` → **增量计数** | `.fire.log` 跨 boot/跨轮累积，历史残留标记会让新一轮第 1 轮就误判 break，整轮循环报废 | `RootUserService.countIn()` 快照轮前计数，仅本轮新增才 break |
+| `profile-tuned-reference.conf` 修改回滚 | ghostlock CLI 只接受 `--load-prebuilt-profile/--force-attack/--enable-status-record`，**无任何执行参数入口**，conf 改动无生效路径（纸面修改）；conf 必须如实反映 proven bin（MD5 门禁 `b0aa22e0…`） | `git checkout` 恢复 300000 原值，删 fallback_cpus |
+
+> 修正后离线门禁重跑通过。v78 已编译安装（`adb install -r`），fire.sh v10 已推送到 `/data/local/tmp/fire.sh`（6483B, 755）。
+
+### v77（2026-11-10，route_done 卡死断路 + fallback CPU + 30s route 超时）
+
+事故背景：实机 357 次攻击中，`CMP_REQUEUE_PI ret=-1` 是正常中间态（100% 成功都经此）；真正的失败形态是 `multicast route status=0` 在 CMP 后永不出现，exploit 卡在 `waiting route_done` 直到 CLI 240s 超时 → watchdog 硬重启。v77 的核心是「快速失败、不累积 240s 空转」。
+
+| 优化项 | 位置 | 备注 |
+|---|---|---|
+| `profile-tuned-reference.conf`：`route_done_timeout_ms` 300000→30000 | `scripts/tests/profile-tuned-reference.conf` | 避免 exploit 在 `waiting route_done` 处空转 240s 触发 watchdog |
+| `profile-tuned-reference.conf`：新增 `fallback_cpus` (cpu2+cpu3 / cpu4+cpu5) + `kernelsnitch_fallback_cpu = 6` | 同上 | 主路由 (cpu0+cpu1) 路由卡死后自动切换备选 CPU 组，避免与主路由冲突 |
+| `fire.sh` v9：新增 `route_deadlock` 检测——ghostlock 跑但 10s 无 landing → `pkill -9 ghostlock`，exit 1 | `scripts/device-artifacts/fire.sh`（需推设备） | 10s 主动 kill 替代 240s 空转，避免 watchdog 硬重启 |
+| `RootUserService.java`：round loop 新增 route_deadlock 断路——读 `.fire.log` 含 "ROUTE_DEADLOCK" → `break`，不再进入下一轮 | `RootUserService.java` round 循环 | 堆已污染，继续下一轮等于 polluted heap 上重复 lottery（06:59 事故同款 wedge）；break 后提示用户重启手机再试 |
+| 版本三齐 `77 / 2.61 / 45`（`build.gradle.kts`、`GhostRootService version(45)`、`MainActivity version(45)`） | 构建配置 + Java | 强制新 UserService，不复用旧进程 |
+
+> 离线门禁 `scripts/tests/offline_profile_test.py` 通过：`profile.bin` MD5 `b0aa22e0351dbf3871f5997a8f2847cd` 与已验产物一致、multicast_waiter 偏移可复现、执行参数与实测 tuned reference 对齐。v77 未改提权时序/亲和性/重试轮数/profile 字节，仅在 route_done 卡死时提前退出。
 
 ### v45（2026-11-03，06:59 硬重启事故修复 —— 同 boot 二次开火）
 

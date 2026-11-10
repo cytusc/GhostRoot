@@ -633,7 +633,27 @@ public class RootUserService extends IRootRunner.Stub {
                  * signature (vs a silent crash, which would also lack the
                  * native exit line). */
                 writeState("attacking", round);
+                /* v78: 先快照 .fire.log 中 ROUTE_DEADLOCK 的次数 —— 该文件跨
+                 * boot/跨轮累积，v77 直接 contains() 会被历史残留标记误伤
+                 * （首轮即误判 break，整轮循环报废）。 */
+                int deadlockBefore = countIn(readText("/data/local/tmp/.fire.log"), "ROUTE_DEADLOCK");
                 exit = runCli(argv, logFile, 240, null, callback);
+
+                /* v77/v78: route_done 卡死断路 —— fire.sh v10 在 60s 无 landing
+                 * 后（v9 的 10s 窗口实测会误杀落地中位 9-13s 的成功会话，已回调）
+                 * 主动 kill ghostlock，并把 "ROUTE_DEADLOCK" 写入 .fire.log。
+                 * 若本轮因 route_done 卡死提前结束，堆已被污染，继续下一轮
+                 * 等于在 polluted heap 上重复 lottery（已知 wedge 场景，06:59
+                 * 事故即为此类）。仅当本轮出现【新增】标记才 break，交给用户
+                 * 重启手机后再试，避免 240s × 多轮累积触发 watchdog 硬重启。 */
+                String fireLog = readText("/data/local/tmp/.fire.log");
+                int deadlockAfter = countIn(fireLog, "ROUTE_DEADLOCK");
+                if (deadlockAfter > deadlockBefore) {
+                    log(callback, "ROUTE_DEADLOCK detected in .fire.log (+" + (deadlockAfter - deadlockBefore)
+                            + " this round) — breaking round loop, heap polluted");
+                    writeState("route-deadlock", round);
+                    break;
+                }
 
                 String enforce = readText("/sys/fs/selinux/enforce").trim();
                 boolean ksu = readText("/proc/modules").contains("kernelsu");
@@ -2277,5 +2297,18 @@ public class RootUserService extends IRootRunner.Stub {
             return "";
         }
         return sb.toString();
+    }
+
+    /** v78: 统计子串出现次数 —— .fire.log 跨轮累积，必须按增量判断本轮
+     * 是否新出现 ROUTE_DEADLOCK，不能用 contains()（历史残留会误伤）。 */
+    private static int countIn(String text, String needle) {
+        if (text == null || text.isEmpty() || needle == null || needle.isEmpty()) return 0;
+        int count = 0;
+        int idx = 0;
+        while ((idx = text.indexOf(needle, idx)) != -1) {
+            count++;
+            idx += needle.length();
+        }
+        return count;
     }
 }
