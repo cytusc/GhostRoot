@@ -36,3 +36,10 @@ backups/kernel-analysis-20261103/*.tar.gz
 *.p12
 *.hprof
 captures/
+
+# APK 逆向分析工作目录：jadx 反编译源码 + apktool 解包资源 + 原始安装包，
+# 合计约 1.6GB / 5.4 万个文件，可由 apks/*.apk 重新生成，不入库。
+# 仅保留自写的 dex 解析脚本（不依赖 jadx，秒级出类名与方法表）。
+apks/*
+!apks/dexindex.py
+!apks/dexmethods.py
