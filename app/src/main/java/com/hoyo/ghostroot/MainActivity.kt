@@ -380,7 +380,7 @@ class MainActivity : ComponentActivity() {
             }
             ButtonState(text, true)
         } else if (repairScheduled) {
-            ButtonState("修复已调度：待软重启后点我复查", true)
+            ButtonState("修复已调度：软重启后自动复查（可点我立即复查）", true)
         } else {
             ButtonState(if (rootLanded) "Zygisk 修复（提权后点我）" else "Zygisk 修复（需先提权）", true)
         }
@@ -827,7 +827,7 @@ class MainActivity : ComponentActivity() {
                 .processNameSuffix("lsposed")
                 .daemon(false)
                 .debuggable(false)
-                .version(46)
+                .version(47)
             lsposedServiceArgs = args
 
             lsposedConnection = object : ServiceConnection {

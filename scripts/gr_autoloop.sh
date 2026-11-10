@@ -473,7 +473,7 @@ wait_framework_recovery() {
 # 最多 RECHECK_ATTEMPTS 次尝试；期间持续监控 boot_id。
 # 复用调用方的 boot_lost / baseline_ts，直接写回调用方的 outcome/mark。
 recheck_until_znok() {
-    local attempt=0 cd_ts now age due slept waited new_ts
+    local attempt=0 cd_ts now age due slept waited new_ts c_outcome
     while [ "$attempt" -lt "$RECHECK_ATTEMPTS" ]; do
         attempt=$((attempt+1))
         # 1) 现成 zn-ok
@@ -503,6 +503,19 @@ recheck_until_znok() {
                 sleep 15; slept=$((slept+15))
                 if boot_lost; then
                     die "等冷却期间 boot_id 变化（崩溃重启），root 已丢失，停止修复验证"
+                fi
+                # v81: App 侧 zn_verify_after_softreboot.sh 会在软重启恢复后
+                # 只读复查并回写 zn-ok 留痕。冷却等待期间即可消费，不必再
+                # 干等 129s 触发一轮新的 znRepair（那正是 v80 死循环的节拍）。
+                if mark=$(repair_mark); then
+                    new_ts=$(echo "$mark" | awk '{print $1}')
+                    c_outcome=$(echo "$mark" | awk '{print $2}')
+                    if [ "${new_ts:-0}" -gt "$baseline_ts" ] \
+                            && echo "${c_outcome:-}" | grep -q '^zn-ok'; then
+                        outcome="$c_outcome"
+                        log "复查: 冷却等待期间捕获软重启后回写的 zn-ok（ts=${new_ts}）"
+                        return 0
+                    fi
                 fi
             done
         fi

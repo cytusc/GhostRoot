@@ -11,11 +11,12 @@ android {
         applicationId = "com.hoyo.ghostroot"
         minSdk = 26
         targetSdk = 34
-        /* v80: Compose 版 UI + ZN 单例收敛根治（zygiskAutoActivate：
-         * SIGKILL 收敛、收敛后重读 zygote_states、成功判据收紧为单例）。
+        /* v81: ZN 修复链根治 —— 终态前置只读判定（不再「先收敛再读」）、
+         * 修 rootShell 赋值前缀与 for 复合命令的语法冲突、同 boot 软重启
+         * 次数熔断、软重启后自动只读复查回写 zn-ok 留痕。
          * 设备侧沿用项目自有运行时资产，APK 版本不与任何实验构建绑定。 */
-        versionCode = 80
-        versionName = "2.64"
+        versionCode = 81
+        versionName = "2.65"
         testInstrumentationRunner = "com.hoyo.ghostroot.LsposedSmokeTest"
     }
 

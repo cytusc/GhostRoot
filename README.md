@@ -6,10 +6,24 @@
 ## 版本
 
 ```
-versionCode  78
-versionName  2.62
-UserService  46       ← 改 RootUserService 逻辑必须同步 +1
+versionCode  81
+versionName  2.65
+UserService  47       ← 改 RootUserService 逻辑必须同步 +1
 ```
+
+### v81（2026-11-10，ZN 修复自毒死循环根治）
+
+实机取证：设备 `zygiskd status` 已 `zygote_states:2 / inject_state:1 / modules_with_issue:0`（ZN 其实修好了），但 `.gr_zn_repair` 永远停在 `zn-softreboot-scheduled`，autoloop 每 ~170s 重排一次软重启。app 日志逐轮 `zygote_states=2 zn-daemon=7` → `single-instance daemon -> zn-daemon=8 zygote_states=0`。
+
+| 根因（v80 引入） | 修正 |
+|---|---|
+| `rootShell()` = `su -c "<SH_ENV 赋值串> <cmd>"`，cmd 以 `for ...` 开头触发 `/system/bin/sh: syntax error: unexpected 'do'`，kill 收敛命令从未执行，daemon 每轮 +1 | 改单条简单命令 `kill -9 $(pidof zn-daemon)` |
+| 收敛后重读「新建 daemon」的 status 覆盖判据，把真值 2 换成 0（新 daemon 未接驾 zygote） | 删除重读覆盖，zygotes 沿用收敛前只读值 |
+| 成功判据 `zygotes>0 && daemons==1` 叠加失效的 kill → 恒 false，zn-ok 成死代码 | 成功只由**前置只读终态**判定，且排在所有 kill / 软重启之前 |
+| 软重启后无任何路径重读 status 写 `zn-ok`；`scheduled` 被当成功形态；只有 2min 冷却无次数上限 | 新增 `assets/zn_verify_after_softreboot.sh`（root 域 setsid，+45s 起只读复查回写 zn-ok）；`scheduled` 降级 pending（exit=5）；同 boot 软重启上限 2 次 |
+| App 与脚本判据不一致 | `znInjectionVerified()` 与脚本 `zn_status_ok()` 同构：`zygote_states>=2` + `issues=0` + 64/32 位各载两模块 |
+
+配套：`gr_autoloop.sh` 冷却轮询期间消费自动回写的 zn-ok，不再白等 129s 触发新一轮。版本三齐 `81 / 2.65 / 47`。
 
 ### v76（2026-11-09，uapi5 签发者与 UI 证据链修正）
 

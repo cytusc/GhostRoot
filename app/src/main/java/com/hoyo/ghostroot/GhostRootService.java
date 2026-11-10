@@ -218,7 +218,7 @@ public class GhostRootService extends Service {
                  *      （成功会话落地中位 9-13s/最长 35s+，10s 必误杀）；断路判定改
                  *      增量计数（.fire.log 跨轮累积，contains() 会被历史残留误伤）。
                  *      bump 45→46。 */
-                .version(46);
+                .version(47);
     }
 
     @Override
@@ -419,6 +419,7 @@ public class GhostRootService extends Service {
             verdict = code == 0 ? 0 : -1;
             detail = code == 0 ? "zn-repair=ok（自愈链结论与 status 见上方日志）"
                     : code == 4 ? "zn-repair: Zygisk 未激活（结论见日志，建议软重启后复查）"
+                    : code == 5 ? "zn-repair: 已安排框架软重启（待自动复查终态，本次未完成）"
                     : code == 3 ? "zn-repair: root 未落地（su 不可用）—— 先提权再修复"
                     : code == 2 ? "zn-repair: 已有任务在执行中"
                     : "zn-repair failed exit=" + code;

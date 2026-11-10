@@ -109,6 +109,13 @@ public class RootUserService extends IRootRunner.Stub {
     private static final String ASSET_REVIVE = "revive_module_daemons.sh";
     private static final String REVIVE_DIR = "/data/adb/ghostroot";
     private static final String REVIVE_PATH = REVIVE_DIR + "/revive_module_daemons.sh";
+    /* v81: 框架软重启后的只读终态复查脚本 —— 补上「软重启后无人写 zn-ok
+     * 留痕」的缺口（v80 死循环里被忽略的关键一环）。 */
+    private static final String ASSET_ZN_VERIFY = "zn_verify_after_softreboot.sh";
+    private static final String ZN_VERIFY_PATH = REVIVE_DIR + "/zn_verify_after_softreboot.sh";
+    /* v81: 同 boot 软重启次数上限。v60 把冷却 20min→2min 时只保留时间窗、
+     * 没有补次数熔断，失败态每 ~170s 就能重排一轮，App 侧可无限循环。 */
+    private static final int ZN_SOFTREBOOT_MAX_PER_BOOT = 2;
     private static final String FIXED_LIB_MD5 = "2c84145e3efb6f7f045fef3ed1eea4c6";
     /** v20: environment matched to adbd's own shell env (the context that
      * went 2/9 today) — replaces the earlier hand-written PATH order and
@@ -315,27 +322,31 @@ public class RootUserService extends IRootRunner.Stub {
                     }
                     log(callback, "提示: 若上面安排了 soft-reboot，框架将重启 ~40s，"
                             + "期间界面卡住属正常；结束后可再点一次「Zygisk 修复」复查终态");
-                    /* v49: 修复成功留痕 —— 手机端「已修复」按钮状态依据本
-                     * 文件 + 本 boot 时效（ts 距今 <= uptime）判定。framework
-                     * 软重启（stop/start）不清 uptime，状态跨软重启保留；
-                     * 整机重启后自然失效。仅 zn-ok / softreboot-scheduled
-                     * 两种成功形态留痕 —— zn-absent/ 竞态错误不写，避免
-                     * "已修复"误导（按钮保持可点，日志里有真实原因）。 */
+                    /* v81: 留痕分两类语义 —— zn-ok 是「成功结论」，
+                     * zn-softreboot-scheduled 只是「待办调度信号」。后者
+                     * token 必须保留（脚本 recheck_until_znok 与 UI 的
+                     * repairScheduled 都靠它调度），但不再与成功并列，
+                     * 明确 exit=5 表示本次未完成；框架恢复后的真实结论由
+                     * zn_verify_after_softreboot.sh 只读复查后回写 zn-ok。 */
                     if (r.startsWith("zn-ok") || r.equals("zn-softreboot-scheduled")) {
                         writeLine(TMP + "/.gr_zn_repair",
                                 "ts=" + System.currentTimeMillis() / 1000
                                         + " uptime=" + readUptime() + "s outcome=" + r + "\n",
                                 false);
-                        log(callback, "修复留痕: " + TMP + "/.gr_zn_repair");
+                        log(callback, (r.startsWith("zn-ok") ? "修复留痕: " : "修复待办留痕（非成功）: ")
+                                + TMP + "/.gr_zn_repair");
                         /* v51: 同步回写 verdict 的 zn= 字段 —— 否则 UI 的
                          * 「已修复」判定（读 verdict zn 前缀）永远停留在
-                         * 会话留下的旧值（如 zn-softreboot-scheduled），
-                         * 修复按钮永远停在「软重启后建议再点复查」态。
-                         * 只替换 zn= 行，不动 ts/session/verdict（rootLanded
-                         * 的本 boot 时效判定依赖原 ts）。 */
+                         * 会话留下的旧值。只替换 zn= 行，不动 ts/session/
+                         * verdict（rootLanded 的本 boot 时效判定依赖原 ts）。 */
                         if (!VERDICT_FILE.isEmpty()) {
                             rootShell("sed -i 's/^zn=.*/zn=" + r + "/' " + VERDICT_FILE
                                     + " 2>/dev/null", 10);
+                        }
+                        if (!r.startsWith("zn-ok")) {
+                            log(callback, "⚠ 本次仅安排框架软重启，ZN 注入尚未确认；"
+                                    + "软重启后将自动只读复查并回写 zn-ok");
+                            exit = 5;
                         }
                     } else {
                         /* v55: 链路跑完 ≠ 修好 —— 非成功结论显式失败（exit=4），
@@ -1417,6 +1428,19 @@ public class RootUserService extends IRootRunner.Stub {
             // soft-reboot 后无人接驾注入新 zygote（POSTMORTEM-20261104 问题5）。
             rootShell("rm -f /data/adb/zygisksu/.abort_msg " + ZN_MODDIR + "/disable", 10);
             ShellResult st = rootShell(ZN_BIN + " status 2>/dev/null", 20);
+            /* v81 决定性修复：终态前置「只读」判定，必须排在 kill / 起 daemon
+             * / 安排软重启之前。v80 收敛后重读的是「刚新建、还没接驾任何
+             * zygote」的 daemon 状态，必然 0 —— 于是每次复查都把已注入成功
+             * 的 zygote_states=2 判成 0，再安排一轮软重启（自毒死循环）。
+             * 判据与 scripts/gr_autoloop.sh 的 zn_status_ok() 完全同构，
+             * 避免「App 报 zn-ok、脚本终态判 FAIL」。 */
+            if (znInjectionVerified(st)) {
+                int z = parseFieldInt(st.out, "zygote_states");
+                log(callback, "zygisk: 终态已注入（zygote_states=" + z
+                        + "），不做收敛/软重启，直接 zn-ok");
+                deleteDex2oatFlags(callback, "zn-ok-precheck");
+                return "zn-ok-zygote" + z;
+            }
                 if (st.timedOut || !st.ok()) {
                     /* v49：daemon 可能已被闩锁/竞态杀掉 —— 先补一个单例再重读状态 */
                     rootShell("cd " + ZN_MODDIR + " && setsid nohup ./bin/zygiskd daemon "
@@ -1444,30 +1468,25 @@ public class RootUserService extends IRootRunner.Stub {
             int daemons = pidCount("zn-daemon");
             log(callback, "zygisk: zygote_states=" + zygotes + " zn-daemon=" + daemons);
             if (daemons != 1) {
-                /* 2026-11-10: kill(SIGTERM) 杀不掉 zn-daemon —— 实机日志证实
-                 * 每次触发修复实例数 2→3→4→5→6，多实例互抢 ptrace 注入使
-                 * zygote_states 掉回 0（根因即终态验证 FAIL）。改 SIGKILL
-                 * 并在 kill 后再起单例，确保收敛真的发生。 */
-                rootShell("for p in $(pidof zn-daemon); do kill -9 $p 2>/dev/null; done; "
-                        + "sleep 1", 15);
+                /* v81: rootShell() 拼的是 `su -c "<SH_ENV 赋值串> <cmd>"`。
+                 * cmd 以 `for ...` 复合命令开头时，赋值前缀撞上保留字 for，
+                 * 设备 /system/bin/sh 实测报 "syntax error: unexpected 'do'"
+                 * —— v80 的 kill 循环从来没执行过（实机 daemon 数 2→3→…
+                 * →8 每轮 +1 即铁证）。改成单条简单命令，赋值前缀才合法。 */
+                rootShell("kill -9 $(pidof zn-daemon) 2>/dev/null; sleep 1", 15);
                 rootShell("cd " + ZN_MODDIR + " && setsid nohup ./bin/zygiskd daemon "
                         + ">/dev/null 2>&1 </dev/null &", 10);
                 Thread.sleep(2000);
-                /* 2026-11-10: 收敛后必须重读 zygote_states。新起的单例 daemon
-                 * 尚未接驾新 zygote，沿用收敛前读到的旧值会返回 zn-ok-zygote2
-                 * 假成功（脚本随后复查终态 zygote_states=0 判 FAIL）。 */
-                st = rootShell(ZN_BIN + " status 2>/dev/null", 20);
-                zygotes = parseFieldInt(st.out, "zygote_states");
                 daemons = pidCount("zn-daemon");
+                /* v81: 不再重读 status 覆盖 zygotes —— 新建的单例 daemon 还没
+                 * 接驾任何 zygote，它的 0 不是系统状态，是验证动作自己造出来的
+                 * 假失败。收敛只负责进程数，判据一律以只读终态为准。 */
                 log(callback, "zygisk: single-instance daemon -> zn-daemon=" + daemons
-                        + " zygote_states=" + zygotes);
+                        + "（zygotes 沿用收敛前只读值 " + zygotes + "）");
             }
-            /* 2026-11-10: daemons>=1 会放过收敛失败（6 个实例也判 zn-ok）；
-             * 只有收敛成唯一实例且确实注入了 zygote 才允许报成功。 */
-            if (zygotes > 0 && daemons == 1) {
-                deleteDex2oatFlags(callback, "zn-ok");
-                return "zn-ok-zygote" + zygotes;
-            }
+            /* v81: 成功只由「前置只读终态」判定。走到这里说明确实未注入，
+             * 不再用「收敛后的 zygote_states / daemons 数量」二次判成功 ——
+             * v80 的 daemons==1 约束叠加失效的 kill，使 zn-ok 成为死代码。 */
             File mark = new File(ZN_SOFTREBOOT_MARK);
             long ageMin = mark.isFile()
                     ? (System.currentTimeMillis() - mark.lastModified()) / 60000L
@@ -1475,8 +1494,19 @@ public class RootUserService extends IRootRunner.Stub {
             if (ageMin < ZN_SOFTREBOOT_COOLDOWN_MIN) {
                 return "zn-zygote0-softreboot-cooldown(" + ageMin + "m)";
             }
+            /* v81: 同 boot 次数熔断。只有 2min 冷却而没有次数上限时，失败态
+             * 每 ~170s 就能重排一次软重启，App 侧可无限循环。count 写进 mark，
+             * 脚本只读 ts/mtime，新增字段不影响既有协议。 */
+            int used = softRebootCountThisBoot();
+            if (used >= ZN_SOFTREBOOT_MAX_PER_BOOT) {
+                log(callback, "zygisk: 本 boot 已安排 " + used + " 次软重启（上限 "
+                        + ZN_SOFTREBOOT_MAX_PER_BOOT + "）—— 拒绝再安排，请整机重启"
+                        + "或人工检查 ZN 模块状态");
+                return "zn-error:softreboot-exhausted(" + used + ")";
+            }
             writeLine(ZN_SOFTREBOOT_MARK, "ts=" + System.currentTimeMillis() / 1000
-                    + " uptime=" + readUptime() + "s zygotes=" + zygotes + "\n", false);
+                    + " uptime=" + readUptime() + "s zygotes=" + zygotes
+                    + " count=" + (used + 1) + "\n", false);
             /* v61 关键修复：软重启从手搓 stop/start 改为 /data/adb/ksud soft-reboot。
              * 根因链（2026-11-05 13:47-14:10 全链排查）：module.prop 损坏 →
              * post-fs-data 的 daemon 读不到模块元数据静默退出 → 本 boot 注入
@@ -1521,12 +1551,92 @@ public class RootUserService extends IRootRunner.Stub {
             // 检查并复活（运行各模块自带的 boot-completed.sh，等价开机）。
             rootShell("setsid sh -c 'sleep 45; /system/bin/sh /data/adb/ghostroot/revive_module_daemons.sh'"
                     + " >/dev/null 2>&1 </dev/null &", 8);
+            /* v81: 软重启后自动只读终态复查 —— 补上「没人写 zn-ok」的缺口。
+             * 之前 znRepair 安排完软重启就返回，App 侧没有任何路径会在框架
+             * 恢复后重读 status；脚本只认 ^zn-ok 留痕，于是永远判负并重排
+             * 软重启。这条 setsid 任务活在 root 域，不受框架 stop 影响。 */
+            if (deployZnVerifyScript(callback)) {
+                rootShell("setsid sh -c 'sleep 45; /system/bin/sh " + ZN_VERIFY_PATH
+                        + "' >/dev/null 2>&1 </dev/null &", 8);
+                log(callback, "zygisk: 已挂号软重启后终态复查（+45s 起，只读 status 自动回写 zn-ok）");
+            }
             log(callback, "zygisk: zygote NOT hooked (late-load race) -> framework soft reboot "
                     + "scheduled; ZN will catch the fresh zygote (~40s)");
             return "zn-softreboot-scheduled";
         } catch (Throwable e) {
             return "zn-error:" + e.getClass().getSimpleName();
         }
+    }
+
+    /** v81: 与 scripts/gr_autoloop.sh 的 zn_status_ok() 完全同构的终态判据 ——
+     * 双 zygote 注入 + 0 issues + 64/32 位各载 hma_oss_zygisk / zygisk_lsposed。
+     * App 与脚本用同一把尺子，避免「App 报 zn-ok、脚本终态判 FAIL」。 */
+    private static boolean znInjectionVerified(ShellResult st) {
+        if (st == null || st.timedOut || !st.ok() || st.out == null) {
+            return false;
+        }
+        if (parseFieldInt(st.out, "zygote_states") < 2
+                || parseFieldInt(st.out, "modules_with_issue") != 0) {
+            return false;
+        }
+        String m64 = "", m32 = "";
+        for (String line : st.out.split("\n")) {
+            if (line.startsWith("modules64:")) {
+                m64 = line;
+            } else if (line.startsWith("modules32:")) {
+                m32 = line;
+            }
+        }
+        return m64.contains("hma_oss_zygisk") && m64.contains("zygisk_lsposed")
+                && m32.contains("hma_oss_zygisk") && m32.contains("zygisk_lsposed");
+    }
+
+    /** v81: 本 boot 已安排的软重启次数。整机重启后 uptime 倒退 → 归零。
+     * mark 的 count 字段由本版本写入，老格式无 count 时返回 0。 */
+    private int softRebootCountThisBoot() {
+        String raw = readText(ZN_SOFTREBOOT_MARK);
+        if (raw == null || raw.isEmpty()) {
+            return 0;
+        }
+        double markUp = -1;
+        int count = 0;
+        for (String line : raw.split("\n")) {
+            String l = line.trim();
+            if (l.startsWith("uptime=")) {
+                try {
+                    markUp = Double.parseDouble(l.substring(7).replace("s", "").trim());
+                } catch (NumberFormatException ignored) {
+                }
+            } else if (l.startsWith("count=")) {
+                try {
+                    count = Integer.parseInt(l.substring(6).trim());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+        if (markUp < 0 || readUptime() + 5 < markUp) {
+            return 0;
+        }
+        return count;
+    }
+
+    /** v81: 部署软重启后终态复查脚本（root 域 setsid 任务不依赖 App 存活）。 */
+    private boolean deployZnVerifyScript(ILogCallback callback) {
+        File local = new File(TMP, ASSET_ZN_VERIFY);
+        boolean ok = false;
+        try {
+            ok = copyAsset(ASSET_ZN_VERIFY, local);
+        } catch (Exception e) {
+            log(callback, "ZN 复查脚本: 资产拷贝失败 " + e);
+        }
+        if (!ok || !local.isFile()) {
+            log(callback, "ZN 复查脚本: asset 不可用，本轮退化为手动复查");
+            return false;
+        }
+        ShellResult r = rootShell("mkdir -p " + REVIVE_DIR + " && cp "
+                + local.getAbsolutePath() + " " + ZN_VERIFY_PATH
+                + " && chmod 700 " + ZN_VERIFY_PATH, 10);
+        return r.ok();
     }
 
     /** 保留既有工行兼容策略；框架初始化后再次清除该属性。 */
