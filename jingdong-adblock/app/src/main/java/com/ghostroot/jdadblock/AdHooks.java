@@ -71,7 +71,7 @@ public final class AdHooks {
             public Object intercept(XposedInterface.Chain chain) throws Throwable {
                 Object r = chain.proceed();
                 if (r instanceof View) {
-                    inspect((View) r, "inflate");
+                    guardedInspect((View) r, "inflate");
                 }
                 return r;
             }
@@ -94,7 +94,7 @@ public final class AdHooks {
                 Object a0 = L.arg(chain, 0);
                 Object r = chain.proceed();
                 if (a0 instanceof View) {
-                    inspect((View) a0, "addView");
+                    guardedInspect((View) a0, "addView");
                 }
                 return r;
             }
@@ -117,7 +117,7 @@ public final class AdHooks {
                 Object r = chain.proceed();
                 Object self = L.self(chain);
                 if (self instanceof View) {
-                    inspect((View) self, "attach");
+                    guardedInspect((View) self, "attach");
                 }
                 return r;
             }
@@ -132,6 +132,22 @@ public final class AdHooks {
             return LOGGED.add(key);
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /**
+     * Nested hooks (inspect -> performClick -> host creates Views -> attach)
+     * must not re-enter the rule engine. Only the inspection is guarded;
+     * chain.proceed() always runs inside the hooker itself.
+     */
+    private static void guardedInspect(View v, String from) {
+        if (!L.enterInspect()) {
+            return;
+        }
+        try {
+            inspect(v, from);
+        } finally {
+            L.exitInspect();
         }
     }
 
@@ -208,6 +224,10 @@ public final class AdHooks {
 
     private static void tryClick(View v, int round) {
         if (skipClicked) {
+            return;
+        }
+        if (!v.isAttachedToWindow()) {
+            L.i("click skipped, view detached, round=" + round);
             return;
         }
         boolean ok = false;

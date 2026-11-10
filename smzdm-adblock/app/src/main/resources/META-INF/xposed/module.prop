@@ -1,7 +1,7 @@
 id=com.ghostroot.smzdmadblock
 name=SMZDM AdBlock
-version=1.2.0
-versionCode=3
+version=1.3.0
+versionCode=4
 author=GhostRoot
 description=Splash ad skip straight to home + home floating promo bubble removal for com.smzdm.client.android
 minApiVersion=100

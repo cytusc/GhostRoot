@@ -102,7 +102,7 @@ public final class AdHooks {
                 Object a0 = L.arg(chain, 0);
                 Object r = chain.proceed();
                 if (a0 instanceof View) {
-                    inspect((View) a0, "addView");
+                    guardedInspect((View) a0, "addView");
                 }
                 return r;
             }
@@ -125,11 +125,27 @@ public final class AdHooks {
                 Object r = chain.proceed();
                 Object self = L.self(chain);
                 if (self instanceof View) {
-                    inspect((View) self, "attach");
+                    guardedInspect((View) self, "attach");
                 }
                 return r;
             }
         });
+    }
+
+    /**
+     * Nested hooks (inspect -> performClick -> host creates Views -> attach)
+     * must not re-enter the rule engine. Only the inspection is guarded;
+     * chain.proceed() always runs inside the hooker itself.
+     */
+    private static void guardedInspect(View v, String from) {
+        if (!L.enterInspect()) {
+            return;
+        }
+        try {
+            inspect(v, from);
+        } finally {
+            L.exitInspect();
+        }
     }
 
     private static void inspect(View v, String from) {
