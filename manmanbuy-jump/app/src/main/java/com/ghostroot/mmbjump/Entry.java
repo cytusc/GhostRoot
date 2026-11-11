@@ -3,6 +3,7 @@ package com.ghostroot.mmbjump;
 import android.app.Application;
 import android.os.Build;
 
+import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
@@ -53,6 +54,30 @@ public final class Entry extends XposedModule {
 
         L.i("target loaded: " + pkg + " classloader=" + L.classLoaderOf(param));
         SplashJump.install(L.classLoaderOf(param));
+        // v1.0.12 probe: are ANY hooks dispatching in this process? View-level
+        // hooks fire constantly in every app; if these stay silent while the
+        // hooks are installed, a host-side anti-hook SDK is restoring entry
+        // points process-wide and no hook point will ever work here.
+        try {
+            L.hook("probe.ViewGroup.addView",
+                    android.view.ViewGroup.class.getDeclaredMethod("addView",
+                            android.view.View.class, android.view.ViewGroup.LayoutParams.class),
+                    new XposedInterface.Hooker() {
+                        private volatile boolean logged = false;
+
+                        @Override
+                        public Object intercept(io.github.libxposed.api.XposedInterface.Chain chain)
+                                throws Throwable {
+                            if (!logged) {
+                                logged = true;
+                                L.i("PROBE FIRED: ViewGroup.addView");
+                            }
+                            return chain.proceed();
+                        }
+                    });
+        } catch (Throwable t) {
+            L.e("probe addView failed", t);
+        }
         detachIfSupported();
     }
 

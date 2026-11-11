@@ -33,32 +33,21 @@ public final class SplashJump {
     }
 
     public static synchronized void install(ClassLoader cl) {
-        // Hook Activity.performCreate instead of Activity.onCreate:
-        // hosts whose splash overrides onCreate (or swaps in a custom
-        // Instrumentation, observed on com.manmanbuy.bijia) dispatch away
-        // from the framework methods, and this ROM's AOT-compiled invoke-super
-        // bypasses the hook entrypoint. performCreate is FINAL on
-        // android.app.Activity, so no host code can override it and every
-        // activity creation must pass through it, before any host onCreate
-        // code. Class names are matched at runtime because some hosts load
-        // their splash from a dynamically added dex that is not visible at
-        // onPackageLoaded time.
-        Method create = null;
+        // Hook Activity.onCreate — the point proven live on this device
+        // (smzdm-adblock v1.4.0 jumps every cold start). A previous attempt
+        // hooked the final Activity.performCreate: the hook installed without
+        // error but NEVER fired, because this ROM's AOT-compiled framework
+        // dispatches straight into the compiled body and bypasses the patched
+        // entrypoint. onCreate is virtual, so every call routes through the
+        // method entrypoint and the hook intercepts reliably.
+        // Class names are matched at runtime because some hosts load their
+        // splash from a dynamically added dex that is not visible at
+        // onPackageLoaded time, so Class.forName on the host loader fails.
+        Method create;
         try {
-            for (Method m : Activity.class.getDeclaredMethods()) {
-                if ("performCreate".equals(m.getName())) {
-                    Class<?>[] ps = m.getParameterTypes();
-                    if (ps.length == 1 && ps[0] == Bundle.class) {
-                        create = m;
-                        break;
-                    }
-                }
-            }
+            create = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
         } catch (Throwable t) {
-            L.e("scan performCreate failed (no jump)", t);
-        }
-        if (create == null) {
-            L.e("locate Activity.performCreate failed (no jump)", new Throwable("performCreate missing"));
+            L.e("locate Activity.onCreate failed (no jump)", t);
             return;
         }
         create.setAccessible(true);

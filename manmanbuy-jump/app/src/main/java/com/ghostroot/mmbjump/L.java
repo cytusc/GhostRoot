@@ -118,6 +118,27 @@ public final class L {
         }
     }
 
+    /**
+     * Force-deoptimize callers that inlined the hooked method. manmanbuy's
+     * AOT-compiled StartActivity.onCreate calls super.onCreate via a direct
+     * compiled branch, bypassing the patched entrypoint entirely (observed:
+     * the hook installs cleanly but never fires, while the same hook works
+     * in smzdm/waimai/zhihu). deoptimize() marks those compiled callers for
+     * deoptimization so the next dispatch routes through the hook.
+     */
+    public static void deopt(String id, Executable target) {
+        XposedModule m = module;
+        if (m == null || target == null) {
+            return;
+        }
+        try {
+            m.deoptimize(target);
+            i("deoptimized callers: " + id + " -> " + target);
+        } catch (Throwable t) {
+            e("deoptimize failed (hook may be bypassed): " + id, t);
+        }
+    }
+
     public static Object self(XposedInterface.Chain chain) {
         try {
             return chain.getThisObject();
