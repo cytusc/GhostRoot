@@ -1,0 +1,11 @@
+id=com.ghostroot.zhjump
+name=ZhihuJump
+version=1.0.3
+versionCode=4
+author=GhostRoot
+description=Deep-link jump straight to home for com.zhihu.android (skips splash ad countdown)
+minApiVersion=100
+targetApiVersion=102
+staticScope=true
+exceptionMode=protective
+autoHotReload=false

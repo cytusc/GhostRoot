@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:versionCode="4"
+    android:versionName="1.0.3">
+
+    <application
+        android:label="知乎 Jump"
+        android:allowBackup="false"
+        android:hasCode="true" />
+
+</manifest>
