@@ -54,7 +54,22 @@ public final class Entry extends XposedModule {
         }
 
         L.i("target loaded: " + pkg + " classloader=" + L.classLoaderOf(param));
-        Hooks.install(L.classLoaderOf(param));
+        // Field switches let us isolate which layer trips SecNeo's native
+        // anti-injection without rebuilding the module:
+        //   /data/local/tmp/sk_nohook -> inject only, install no hooks
+        //   /data/local/tmp/sk_nodlg  -> Activity.onCreate only
+        //   (neither present)        -> all hooks
+        int mode = Hooks.MODE_FULL;
+        try {
+            if (new java.io.File("/data/local/tmp/sk_nohook").exists()) {
+                mode = Hooks.MODE_NONE;
+            } else if (new java.io.File("/data/local/tmp/sk_nodlg").exists()) {
+                mode = Hooks.MODE_NO_DIALOG;
+            }
+        } catch (Throwable ignored) {
+        }
+        L.i("probe mode=" + mode);
+        Hooks.install(L.classLoaderOf(param), mode);
         detachIfSupported();
     }
 

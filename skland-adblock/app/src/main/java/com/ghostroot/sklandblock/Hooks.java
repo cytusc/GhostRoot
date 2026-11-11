@@ -37,6 +37,11 @@ public final class Hooks {
     private static final String SPLASH = PKG + ".splash.SplashActivity";
     private static final String MAIN = PKG + ".MainActivity";
 
+    /** Diagnostic hook modes, selected on-device without rebuilding. */
+    public static final int MODE_NONE = 0;
+    public static final int MODE_NO_DIALOG = 1;
+    public static final int MODE_FULL = 2;
+
     private static volatile boolean jumped = false;
     private static volatile boolean jumpFailed = false;
     private static volatile int actDiag = 0;
@@ -45,9 +50,15 @@ public final class Hooks {
     private Hooks() {
     }
 
-    public static synchronized void install(ClassLoader cl) {
+    public static synchronized void install(ClassLoader cl, int mode) {
+        L.i("install mode=" + mode);
+        if (mode == MODE_NONE) {
+            return;
+        }
         hookActivityCreate();
-        hookDialogShow();
+        if (mode == MODE_FULL) {
+            hookDialogShow();
+        }
     }
 
     /** Single framework hook covers the splash jump and all minors activities. */
