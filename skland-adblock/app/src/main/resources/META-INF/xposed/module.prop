@@ -1,0 +1,11 @@
+id=com.ghostroot.sklandblock
+name=SKLandBlock
+version=1.0.0
+versionCode=1
+author=GhostRoot
+description=Skip splash ad (SplashActivity -> MainActivity) and suppress minors/teenager popups for com.hypergryph.skland
+minApiVersion=100
+targetApiVersion=102
+staticScope=true
+exceptionMode=protective
+autoHotReload=false
