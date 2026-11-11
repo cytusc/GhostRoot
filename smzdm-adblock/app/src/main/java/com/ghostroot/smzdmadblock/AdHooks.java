@@ -54,6 +54,7 @@ public final class AdHooks {
         hookInflate();
         hookAddView();
         hookAttach();
+        SplashJump.install(cl);
         L.i("install done");
     }
 

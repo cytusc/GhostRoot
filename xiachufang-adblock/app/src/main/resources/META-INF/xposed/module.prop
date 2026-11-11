@@ -1,7 +1,7 @@
 id=com.ghostroot.xcfadblock
 name=Xiachufang AdBlock
-version=1.6.0
-versionCode=7
+version=1.7.0
+versionCode=8
 author=GhostRoot
 description=Injected ad-view removal for com.xiachufang (splash and feed)
 minApiVersion=100

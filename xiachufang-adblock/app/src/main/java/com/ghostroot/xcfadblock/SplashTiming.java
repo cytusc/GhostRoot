@@ -21,6 +21,11 @@ public final class SplashTiming {
 
     private static volatile boolean autoClosed = false;
     private static volatile boolean methodsDumped = false;
+    /** v1.7.0: set once the deep-link jump to HomeActivity has been issued. */
+    private static volatile boolean jumped = false;
+    private static volatile boolean jumpFailed = false;
+
+    private static final String MAIN_ACTIVITY = "com.xiachufang.activity.home.HomeActivity";
 
     /** Activity classes are a small fixed set; cache the splash test. */
     private static final java.util.concurrent.ConcurrentHashMap<String, Boolean> SPLASH_CACHE =
@@ -46,11 +51,16 @@ public final class SplashTiming {
                             && isStartPage(act.getClass().getName());
                     if (isSplash) {
                         autoClosed = false;
+                        // v1.7.0: deep-link jump BEFORE the host onCreate runs
+                        // any of its ad/countdown waits. Same path an ad
+                        // deep-link takes; if it fails we fall back to the
+                        // v1.6 host-callback navigation below.
+                        jumpToHome(act);
                     }
                     // Host onCreate must finish before we poke its callbacks.
                     Object r = chain.proceed();
-                    if (isSplash) {
-                        L.i("splash onCreate done: " + act.getClass().getName());
+                    if (isSplash && !jumped) {
+                        L.i("splash onCreate done (jump fallback): " + act.getClass().getName());
                         dumpMethods(act.getClass());
                         scheduleAutoClose(act);
                     }
@@ -59,6 +69,35 @@ public final class SplashTiming {
             });
         } catch (Throwable t) {
             L.e("hook onCreate failed", t);
+        }
+    }
+
+    /**
+     * v1.7.0: navigate to HomeActivity directly and finish the splash, before
+     * the host onCreate runs. REORDER_TO_FRONT keeps this idempotent when the
+     * host's own (late) navigation also fires. Only GONE-less, control-flow
+     * preserving on failure: any exception resets the flags so the v1.6
+     * onAdClose fallback stays armed.
+     */
+    private static void jumpToHome(Activity act) {
+        if (jumped || jumpFailed) {
+            return;
+        }
+        try {
+            android.content.Intent i = new android.content.Intent();
+            i.setClassName(act.getPackageName(), MAIN_ACTIVITY);
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
+            act.startActivity(i);
+            act.finish();
+            try {
+                act.overridePendingTransition(0, 0);
+            } catch (Throwable ignored) {
+            }
+            jumped = true;
+            L.i("jump to " + MAIN_ACTIVITY + " from splash onCreate");
+        } catch (Throwable t) {
+            jumpFailed = true;
+            L.e("jump failed, falling back to onAdClose", t);
         }
     }
 
