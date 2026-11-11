@@ -1,0 +1,11 @@
+id=com.ghostroot.wkblock
+name=WKAdBlock
+version=1.0.2
+versionCode=3
+author=GhostRoot
+description=Remove splash ad and interstitial popup ad from com.snda.wifilocating (WiFi Master Key)
+minApiVersion=100
+targetApiVersion=102
+staticScope=true
+exceptionMode=protective
+autoHotReload=false
