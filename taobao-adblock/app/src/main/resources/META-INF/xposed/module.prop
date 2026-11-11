@@ -1,7 +1,7 @@
 id=com.ghostroot.tbadblock
 name=Taobao AdBlock
-version=1.5.0
-versionCode=6
+version=1.7.0
+versionCode=8
 author=GhostRoot
 description=Skip the bootimage window (ad + brand animation) and the white Welcome launch page so Taobao goes straight to the home page (com.taobao.taobao)
 minApiVersion=100

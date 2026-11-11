@@ -3,6 +3,7 @@ package com.ghostroot.tbadblock;
 import android.app.Activity;
 import android.content.Context;
 import android.content.ContextWrapper;
+import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
 import android.os.Bundle;
@@ -142,15 +143,22 @@ public final class AdHooks {
         L.hook("tb.welcome.create", m, new XposedInterface.Hooker() {
             @Override
             public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                Object r = chain.proceed();
                 Object self = L.self(chain);
-                if (welcome.isInstance(self)) {
-                    Activity a = (Activity) self;
+                boolean isWelcome = self != null && welcome.isInstance(self);
+                if (isWelcome) {
+                    // v1.7.0: jump BEFORE Welcome.onCreate runs. Welcome's own
+                    // onCreate (config fetches etc.) is skipped entirely, so
+                    // TBMainActivity is created as early as the process
+                    // allows and the system splash window is dismissed the
+                    // moment the home activity draws its first frame.
+                    jumpToMain((Activity) self);
+                }
+                Object r = chain.proceed();
+                if (isWelcome) {
                     if (once("welcome-early")) {
                         L.i("early clear Welcome window in onCreate");
                     }
-                    clearLaunchPage(a);
-                    hideLaunchPage(a);
+                    clearLaunchPage((Activity) self);
                 }
                 return r;
             }
@@ -232,6 +240,31 @@ public final class AdHooks {
             }
         } catch (Throwable t) {
             L.e("clearLaunchPage failed", t);
+        }
+    }
+
+    /**
+     * v1.6.0: deep-link style direct entry. The moment Welcome.onCreate has
+     * run, start TBMainActivity and finish Welcome. Welcome never gets a
+     * chance to draw its splash overlay or run its ad/countdown waits; the
+     * home activity appears as soon as the process is ready — the same way
+     * an ad deep-link enters the app. If the main activity is missing in a
+     * future release we just log and the v1.2-v1.5 suppression keeps working.
+     */
+    private static void jumpToMain(final Activity a) {
+        try {
+            Intent i = new Intent();
+            i.setClassName(a.getPackageName(), "com.taobao.tao.TBMainActivity");
+            i.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
+            a.startActivity(i);
+            a.finish();
+            try {
+                a.overridePendingTransition(0, 0);
+            } catch (Throwable ignored) {
+            }
+            L.i("jump to TBMainActivity from Welcome.onCreate");
+        } catch (Throwable t) {
+            L.e("jumpToMain failed (launch page stays)", t);
         }
     }
 
