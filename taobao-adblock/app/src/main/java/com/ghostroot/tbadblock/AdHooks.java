@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.ContextWrapper;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -96,14 +97,26 @@ public final class AdHooks {
      * start and only in the launch Activity. If the class is ever missing
      * (split / renamed in a future release) we just log and keep the v1.2
      * bootimage suppression working.
+     *
+     * v1.4.0: also hook Activity.onCreate (framework class, instance-filtered
+     * to Welcome) and clear the window synchronously right after onCreate.
+     * At that point no frame has been drawn yet, so the very first frame
+     * Welcome paints is already transparent — the onResume path stays as a
+     * fallback for ROMs where the decor is rebuilt later.
      */
     private static void hookWelcome(ClassLoader cl) {
         if (cl == null) {
             return;
         }
-        Method m = null;
+        final Class<?> welcome;
         try {
-            Class<?> welcome = Class.forName("com.taobao.tao.welcome.Welcome", false, cl);
+            welcome = Class.forName("com.taobao.tao.welcome.Welcome", false, cl);
+        } catch (Throwable t) {
+            L.e("locate Welcome failed (launch page stays)", t);
+            return;
+        }
+        Method m;
+        try {
             m = welcome.getDeclaredMethod("onResume");
         } catch (Throwable t) {
             L.e("locate Welcome.onResume failed (launch page stays)", t);
@@ -116,6 +129,28 @@ public final class AdHooks {
                 Object self = L.self(chain);
                 if (self instanceof Activity) {
                     hideLaunchPage((Activity) self);
+                }
+                return r;
+            }
+        });
+        try {
+            m = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
+        } catch (Throwable t) {
+            L.e("locate Activity.onCreate failed", t);
+            return;
+        }
+        L.hook("tb.welcome.create", m, new XposedInterface.Hooker() {
+            @Override
+            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                Object r = chain.proceed();
+                Object self = L.self(chain);
+                if (welcome.isInstance(self)) {
+                    Activity a = (Activity) self;
+                    if (once("welcome-early")) {
+                        L.i("early clear Welcome window in onCreate");
+                    }
+                    clearLaunchPage(a);
+                    hideLaunchPage(a);
                 }
                 return r;
             }
@@ -182,15 +217,51 @@ public final class AdHooks {
                     }
                 }
             }
+            // v1.5.0: the splash logo can also be an overlay added directly to
+            // the decor (AndroidX SplashScreen compat keeps the system splash
+            // alive as an in-app overlay view). Hide every decor child that is
+            // not on the android.R.id.content path. Only GONE, never remove.
+            if (decor instanceof ViewGroup && content != null) {
+                ViewGroup d = (ViewGroup) decor;
+                for (int i = 0; i < d.getChildCount(); i++) {
+                    View c = d.getChildAt(i);
+                    if (c != null && c.getVisibility() != View.GONE && !isOnContentPath(c, content)) {
+                        c.setVisibility(View.GONE);
+                    }
+                }
+            }
         } catch (Throwable t) {
             L.e("clearLaunchPage failed", t);
         }
+    }
+
+    /** True if {@code node} lies on the decor -> content ancestor path. */
+    private static boolean isOnContentPath(View node, View content) {
+        View v = content;
+        while (v != null) {
+            if (v == node) {
+                return true;
+            }
+            ViewParent p = v.getParent();
+            v = (p instanceof View) ? (View) p : null;
+        }
+        return false;
     }
 
     /** One-time structural evidence: confirms the white page is Welcome's own content. */
     private static void dumpLaunchChildren(Activity a) {
         try {
             View decor = a.getWindow().getDecorView();
+            if (decor instanceof ViewGroup) {
+                ViewGroup d = (ViewGroup) decor;
+                for (int i = 0; i < d.getChildCount(); i++) {
+                    View c = d.getChildAt(i);
+                    if (c != null) {
+                        L.i("welcome decor child[" + i + "]: " + Names.idName(c)
+                                + " / " + c.getClass().getName());
+                    }
+                }
+            }
             View content = decor.findViewById(android.R.id.content);
             if (!(content instanceof ViewGroup)) {
                 L.i("welcome content is not a ViewGroup");
