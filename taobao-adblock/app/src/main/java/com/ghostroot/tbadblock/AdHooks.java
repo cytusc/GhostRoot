@@ -1,5 +1,10 @@
 package com.ghostroot.tbadblock;
 
+import android.app.Activity;
+import android.content.Context;
+import android.content.ContextWrapper;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -14,21 +19,34 @@ import java.util.concurrent.atomic.AtomicInteger;
 import io.github.libxposed.api.XposedInterface;
 
 /**
- * View-level splash skip for com.taobao.taobao.
+ * Whole-window bootimage suppression for com.taobao.taobao.
+ *
+ * Live evidence (3 cold starts, 10.66.0): Welcome draws a white "淘" launch
+ * page, then the app adds a FrameLayout app:id/fl_root_view on TOP of
+ * TBMainActivity. That window contains FilletLinearLayout
+ * app:id/fl_animation_view (the double-11 brand animation), ll_close /
+ * tv_close / tv_countdown, and the creative. It is not an Activity, so there
+ * is no splash Activity to finish.
+ *
+ * v1.1 only pressed ll_close. That still leaves the brand-animation window
+ * on screen when the server sends no ad (no skip control is inflated), and
+ * it leaves a visible transition even when the click succeeds. v1.2 hides
+ * the entire bootimage window as soon as its root is added and keeps it
+ * hidden for the full animation/countdown duration. We intentionally do NOT
+ * remove the View from its parent: the host keeps a reference to it and
+ * later dismisses it itself. GONE is enough to make the home page visible
+ * and interactive underneath, and the host's own dismiss path stays intact
+ * (we still press ll_close when it exists).
  *
  * Every interceptor proceeds first and catches everything, so a rule mistake
  * can never change the host's control flow. All ids are resolved through a
  * cache because these hooks run for every View in a very large app.
- *
- * v1 deliberately does NOT hide the ad Views. Taobao ships libsgmain and JD
- * ships an active risk-control CAPTCHA; collapsing the ad root while the
- * host countdown is still running risks leaving a stuck window. Pressing the
- * app's own skip control is the least invasive way out, and it happens during
- * inflate/addView/attach, i.e. before the first ad frame is drawn.
  */
 public final class AdHooks {
 
-    private static final boolean HIDE_AD_VIEW = false;
+    /** Cover the whole brand animation / countdown; the host may re-show the window. */
+    private static final long[] SUPPRESS_DELAYS =
+            {0L, 60L, 150L, 300L, 600L, 1000L, 1600L, 2500L, 4000L, 6000L};
     private static final long CLICK_WINDOW_MS = 10_000L;
     /** The skip container starts GONE and gets its listener only when the countdown begins. */
     private static final long[] RETRY_DELAYS = {0L, 200L, 500L, 1000L, 1800L, 3000L};
@@ -36,6 +54,9 @@ public final class AdHooks {
     private static volatile boolean installed = false;
     private static volatile boolean skipClicked = false;
     private static volatile long lastClickAt = 0L;
+    private static volatile View suppressedRoot = null;
+    private static volatile long lastSuppressAt = 0L;
+    private static volatile Handler mainHandler = null;
 
     private static final AtomicInteger INSPECTED = new AtomicInteger();
     private static final AtomicInteger HITS = new AtomicInteger();
@@ -180,15 +201,165 @@ public final class AdHooks {
             if (adCls || Names.isAdId(name)) {
                 HITS.incrementAndGet();
                 if (once("ad:" + name + ":" + cls)) {
-                    L.i("ad view " + from + ": " + name + " / " + cls);
+                    L.i("ad view " + from + ": " + name + " / " + cls
+                            + " act=" + activityName(v));
                 }
-                if (HIDE_AD_VIEW) {
-                    collapse(v);
+                if (Names.isWindowRoot(name)) {
+                    if (isBootImageWindow(v)) {
+                        suppressWindow(v);
+                    } else {
+                        recheckLater(v);
+                    }
+                } else if (adCls) {
+                    // The brand-animation container. GONE before the first frame.
+                    setGone(v);
                 }
             }
         } catch (Throwable t) {
             L.e("inspect failed", t);
         }
+    }
+
+    /**
+     * The bootimage root is a plain FrameLayout, so the id alone is not
+     * specific enough to be safe on a huge app. Require a bootimage child
+     * (the animation container or the skip controls) before hiding anything.
+     * The children are all added before the root itself reaches addView, as
+     * the live hook log shows.
+     */
+    private static boolean isBootImageWindow(View v) {
+        if (!(v instanceof ViewGroup)) {
+            return false;
+        }
+        ViewGroup root = (ViewGroup) v;
+        int budget = 160;
+        for (int i = 0; i < root.getChildCount() && budget > 0; i++) {
+            View c = root.getChildAt(i);
+            budget--;
+            if (c == null) {
+                continue;
+            }
+            String n = Names.idName(c);
+            if (Names.isAdId(n) || Names.isSkip(n)
+                    || Names.isAdClass(c.getClass().getName())) {
+                return true;
+            }
+            if (c instanceof ViewGroup) {
+                ViewGroup g = (ViewGroup) c;
+                for (int j = 0; j < g.getChildCount() && budget > 0; j++) {
+                    View cc = g.getChildAt(j);
+                    budget--;
+                    if (cc == null) {
+                        continue;
+                    }
+                    String nn = Names.idName(cc);
+                    if (Names.isAdId(nn) || Names.isSkip(nn)
+                            || Names.isAdClass(cc.getClass().getName())) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * inflate() can expose the root before its children are attached. Give the
+     * host a few frames to finish building the window, then check again.
+     */
+    private static void recheckLater(final View v) {
+        if (!once("root-recheck:" + Names.idName(v))) {
+            return;
+        }
+        L.i("bootimage root not ready, recheck scheduled: " + Names.idName(v));
+        long[] delays = {120L, 400L, 900L};
+        for (long delay : delays) {
+            try {
+                Handler h = mainHandler;
+                if (h == null) {
+                    h = new Handler(Looper.getMainLooper());
+                    mainHandler = h;
+                }
+                h.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            if (isBootImageWindow(v)) {
+                                suppressWindow(v);
+                            }
+                        } catch (Throwable t) {
+                            L.e("root recheck failed", t);
+                        }
+                    }
+                }, delay);
+            } catch (Throwable t) {
+                L.e("root recheck post failed", t);
+            }
+        }
+    }
+
+    /** Hide the whole window and keep it hidden while the host plays its animation. */
+    private static void suppressWindow(final View v) {
+        long now = SystemClock.uptimeMillis();
+        if (suppressedRoot == v && now - lastSuppressAt < CLICK_WINDOW_MS) {
+            return;
+        }
+        suppressedRoot = v;
+        lastSuppressAt = now;
+        L.i("suppress bootimage window: " + Names.idName(v)
+                + " / " + v.getClass().getName() + " act=" + activityName(v));
+        for (long delay : SUPPRESS_DELAYS) {
+            postGone(v, delay);
+        }
+    }
+
+    private static void postGone(final View v, long delay) {
+        try {
+            Handler h = mainHandler;
+            if (h == null) {
+                h = new Handler(Looper.getMainLooper());
+                mainHandler = h;
+            }
+            final Handler target = h;
+            Runnable r = new Runnable() {
+                @Override
+                public void run() {
+                    setGone(v);
+                }
+            };
+            if (delay <= 0) {
+                target.post(r);
+            } else {
+                target.postDelayed(r, delay);
+            }
+        } catch (Throwable t) {
+            L.e("postGone failed", t);
+        }
+    }
+
+    private static void setGone(View v) {
+        try {
+            if (v.getVisibility() != View.GONE) {
+                v.setVisibility(View.GONE);
+            }
+        } catch (Throwable t) {
+            L.e("setGone failed", t);
+        }
+    }
+
+    private static String activityName(View v) {
+        try {
+            Context c = v.getContext();
+            int guard = 0;
+            while (c instanceof ContextWrapper && guard++ < 8) {
+                if (c instanceof Activity) {
+                    return c.getClass().getName();
+                }
+                c = ((ContextWrapper) c).getBaseContext();
+            }
+        } catch (Throwable ignored) {
+        }
+        return "?";
     }
 
     /**
@@ -305,14 +476,4 @@ public final class AdHooks {
         return false;
     }
 
-    private static void collapse(View v) {
-        try {
-            if (v.getVisibility() == View.GONE) {
-                return;
-            }
-            v.setVisibility(View.GONE);
-        } catch (Throwable t) {
-            L.e("collapse failed", t);
-        }
-    }
 }

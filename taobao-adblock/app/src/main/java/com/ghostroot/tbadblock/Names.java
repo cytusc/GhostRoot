@@ -99,6 +99,17 @@ public final class Names {
                 && AD_IDS.contains(name.toLowerCase(Locale.ROOT));
     }
 
+    /**
+     * The full-screen FrameLayout that carries the whole bootimage window.
+     * Hiding this one node removes the ad creative AND the brand animation,
+     * even on starts where the server sends no ad and no skip control is
+     * inflated. It is only acted on after isBootImageWindow() confirms a
+     * bootimage child, so an unrelated fl_root_view elsewhere is untouched.
+     */
+    public static boolean isWindowRoot(String name) {
+        return "fl_root_view".equals(name);
+    }
+
     /** Only the boot-image package is treated as ad SDK code. */
     public static boolean isAdClass(String cls) {
         if (cls == null || cls.isEmpty()) {

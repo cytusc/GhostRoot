@@ -1,9 +1,9 @@
 id=com.ghostroot.tbadblock
 name=Taobao AdBlock
-version=1.1.0
-versionCode=2
+version=1.2.0
+versionCode=3
 author=GhostRoot
-description=Boot-image splash skip: click ll_close/tv_close so Taobao dismisses the ad itself (com.taobao.taobao)
+description=Kill the whole bootimage window (ad creative + brand launch animation) so Taobao lands on the home page immediately (com.taobao.taobao)
 minApiVersion=100
 targetApiVersion=102
 staticScope=true
