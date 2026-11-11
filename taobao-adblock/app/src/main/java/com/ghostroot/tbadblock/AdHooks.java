@@ -3,6 +3,8 @@ package com.ghostroot.tbadblock;
 import android.app.Activity;
 import android.content.Context;
 import android.content.ContextWrapper;
+import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -10,6 +12,7 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
+import android.view.Window;
 
 import java.lang.reflect.Method;
 import java.util.Set;
@@ -37,6 +40,16 @@ import io.github.libxposed.api.XposedInterface;
  * later dismisses it itself. GONE is enough to make the home page visible
  * and interactive underneath, and the host's own dismiss path stays intact
  * (we still press ll_close when it exists).
+ *
+ * v1.3 additionally removes the white "淘" launch page. Live window dumps
+ * show Welcome is a translucent Activity (mIsTranslucent=true) and there is
+ * NO separate "Starting com.taobao.taobao" window, so the white page is
+ * drawn by Welcome's own PhoneWindow, not by system_server. Welcome declares
+ * its own onResume() (classes10.dex), which gives us an exact, single-class
+ * hook point -- no need to hook Activity.onResume for every Activity, and no
+ * system-framework scope / zygote restart. We clear the window + decor
+ * backgrounds and GONE the content children; GONE (not remove) keeps every
+ * View findable by the host, so its own navigation logic is untouched.
  *
  * Every interceptor proceeds first and catches everything, so a rule mistake
  * can never change the host's control flow. All ids are resolved through a
@@ -74,7 +87,126 @@ public final class AdHooks {
         hookInflate();
         hookAddView();
         hookAttach();
+        hookWelcome(cl);
         L.i("install done");
+    }
+
+    /**
+     * Welcome overrides onResume() itself, so this hook fires once per cold
+     * start and only in the launch Activity. If the class is ever missing
+     * (split / renamed in a future release) we just log and keep the v1.2
+     * bootimage suppression working.
+     */
+    private static void hookWelcome(ClassLoader cl) {
+        if (cl == null) {
+            return;
+        }
+        Method m = null;
+        try {
+            Class<?> welcome = Class.forName("com.taobao.tao.welcome.Welcome", false, cl);
+            m = welcome.getDeclaredMethod("onResume");
+        } catch (Throwable t) {
+            L.e("locate Welcome.onResume failed (launch page stays)", t);
+            return;
+        }
+        L.hook("tb.welcome", m, new XposedInterface.Hooker() {
+            @Override
+            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                Object r = chain.proceed();
+                Object self = L.self(chain);
+                if (self instanceof Activity) {
+                    hideLaunchPage((Activity) self);
+                }
+                return r;
+            }
+        });
+    }
+
+    /**
+     * Make the whole Welcome window transparent. It is a translucent bridge
+     * Activity; the home page (TBMainActivity) is a separate window that
+     * appears underneath/after it, so nothing is lost by hiding its content.
+     */
+    private static void hideLaunchPage(final Activity a) {
+        if (once("welcome-hidden")) {
+            L.i("hide Welcome launch page: " + a.getClass().getName());
+            dumpLaunchChildren(a);
+        }
+        long[] delays = {0L, 60L, 150L, 300L, 600L, 1000L, 1600L};
+        for (long delay : delays) {
+            try {
+                Handler h = mainHandler;
+                if (h == null) {
+                    h = new Handler(Looper.getMainLooper());
+                    mainHandler = h;
+                }
+                Runnable r = new Runnable() {
+                    @Override
+                    public void run() {
+                        clearLaunchPage(a);
+                    }
+                };
+                if (delay <= 0) {
+                    h.post(r);
+                } else {
+                    h.postDelayed(r, delay);
+                }
+            } catch (Throwable t) {
+                L.e("hideLaunchPage post failed", t);
+            }
+        }
+    }
+
+    private static void clearLaunchPage(Activity a) {
+        try {
+            if (a.isFinishing() || a.isDestroyed()) {
+                return;
+            }
+            Window w = a.getWindow();
+            if (w == null) {
+                return;
+            }
+            w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            View decor = w.getDecorView();
+            if (decor == null) {
+                return;
+            }
+            decor.setBackgroundColor(Color.TRANSPARENT);
+            View content = decor.findViewById(android.R.id.content);
+            if (content instanceof ViewGroup) {
+                ViewGroup g = (ViewGroup) content;
+                for (int i = 0; i < g.getChildCount(); i++) {
+                    View c = g.getChildAt(i);
+                    if (c != null && c.getVisibility() != View.GONE) {
+                        c.setVisibility(View.GONE);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            L.e("clearLaunchPage failed", t);
+        }
+    }
+
+    /** One-time structural evidence: confirms the white page is Welcome's own content. */
+    private static void dumpLaunchChildren(Activity a) {
+        try {
+            View decor = a.getWindow().getDecorView();
+            View content = decor.findViewById(android.R.id.content);
+            if (!(content instanceof ViewGroup)) {
+                L.i("welcome content is not a ViewGroup");
+                return;
+            }
+            ViewGroup g = (ViewGroup) content;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View c = g.getChildAt(i);
+                if (c != null) {
+                    L.i("welcome child[" + i + "]: " + Names.idName(c)
+                            + " / " + c.getClass().getName());
+                }
+            }
+        } catch (Throwable t) {
+            L.e("dumpLaunchChildren failed", t);
+        }
     }
 
     private static void hookInflate() {
@@ -113,6 +245,14 @@ public final class AdHooks {
             @Override
             public Object intercept(XposedInterface.Chain chain) throws Throwable {
                 Object a0 = L.arg(chain, 0);
+                if (a0 instanceof View) {
+                    // Hide BEFORE the view enters the hierarchy so the boot
+                    // image never draws a single frame (the live log shows a
+                    // 30-frame Choreographer skip right after this addView).
+                    // Setting a flag cannot change the host's control flow:
+                    // the addView itself still runs, exactly as the host expects.
+                    preGone((View) a0);
+                }
                 Object r = chain.proceed();
                 if (a0 instanceof View) {
                     guardedInspect((View) a0, "addView");
@@ -153,6 +293,29 @@ public final class AdHooks {
             return LOGGED.add(key);
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /**
+     * Cheap check before chain.proceed(): only cached id/class lookups, then
+     * GONE. The full rule engine still runs after proceed() via inspect().
+     */
+    private static void preGone(View v) {
+        try {
+            boolean hit = false;
+            int id = v.getId();
+            if (id > 0) {
+                String n = Names.idName(v);
+                hit = Names.isWindowRoot(n) || Names.isAdId(n);
+            }
+            if (!hit) {
+                hit = Names.isAdClass(v.getClass().getName());
+            }
+            if (hit) {
+                setGone(v);
+            }
+        } catch (Throwable t) {
+            L.e("preGone failed", t);
         }
     }
 

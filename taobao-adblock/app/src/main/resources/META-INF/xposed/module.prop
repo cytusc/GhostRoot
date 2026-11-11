@@ -1,9 +1,9 @@
 id=com.ghostroot.tbadblock
 name=Taobao AdBlock
-version=1.2.0
-versionCode=3
+version=1.3.0
+versionCode=4
 author=GhostRoot
-description=Kill the whole bootimage window (ad creative + brand launch animation) so Taobao lands on the home page immediately (com.taobao.taobao)
+description=Skip the bootimage window (ad + brand animation) and the white Welcome launch page so Taobao goes straight to the home page (com.taobao.taobao)
 minApiVersion=100
 targetApiVersion=102
 staticScope=true
